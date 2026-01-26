@@ -1,0 +1,76 @@
+[package]
+name = "rustwhiteboard"
+version = "0.1.0"
+edition = "2021"
+description = "Hand-drawn diagram to draw.io converter with OCR and LLM"
+authors = ["RustWhiteboard Team"]
+license = "MIT"
+
+
+[[bin]]
+name = "rustwhiteboard"
+path = "src/main.rs"
+
+[dependencies]
+# Tauri
+tauri = { version = "2.0", features = ["devtools"] }
+tauri-plugin-shell = "2.0"
+tauri-plugin-dialog = "2.0"
+tauri-plugin-fs = "2.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Image processing
+image = "0.25"
+imageproc = "0.24"
+rusttype = "0.9"
+
+# OCR - Tesseract bindings (optional, requires system tesseract)
+tesseract = { version = "0.14", optional = true }
+
+# XML generation for draw.io
+quick-xml = "0.31"
+
+# Shape detection and geometry
+nalgebra = "0.32"
+geo = "0.27"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# UUID for unique IDs
+uuid = { version = "1.6", features = ["v4"] }
+
+# Base64 encoding
+base64 = "0.22"
+
+# Compression for backups
+flate2 = "1.0"
+
+# HTTP client for Ollama API
+reqwest = { version = "0.11", features = ["json"], optional = true }
+
+[features]
+default = []
+ocr = ["tesseract"]
+ollama = ["reqwest"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
