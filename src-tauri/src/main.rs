@@ -207,11 +207,18 @@ async fn export_drawio_file(
     path: String,
     options: ExportOptions,
 ) -> Result<(), String> {
+    log::info!("🔹 export_drawio_file called with path: {}", path);
+
     let xml = generate_drawio(state, options).await?;
-    
+    log::info!("🔹 Generated {} bytes of XML", xml.len());
+
     std::fs::write(&path, &xml)
-        .map_err(|e| format!("Failed to write file: {}", e))?;
-    
+        .map_err(|e| {
+            log::error!("❌ Failed to write file: {}", e);
+            format!("Failed to write file: {}", e)
+        })?;
+
+    log::info!("✅ Successfully wrote file to {}", path);
     Ok(())
 }
 

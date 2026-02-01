@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Default capabilities for RustWhiteboard","local":true,"windows":["main"],"permissions":["core:default","shell:allow-open","dialog:allow-open","dialog:allow-save","dialog:allow-ask","dialog:allow-message","fs:allow-read-file","fs:allow-write-file","fs:allow-read-dir","fs:allow-exists","fs:default",{"identifier":"fs:scope","allow":[{"path":"$APPDATA/**"},{"path":"$DOCUMENT/**"},{"path":"$DOWNLOAD/**"},{"path":"$HOME/**"}]}]}}

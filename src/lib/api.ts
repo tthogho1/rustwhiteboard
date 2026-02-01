@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { open, save, message as showDialog, ask } from '@tauri-apps/plugin-dialog';
 import type { Stroke, ProcessingResult } from '../store';
 
 export interface ExportOptions {
@@ -79,6 +80,30 @@ export const api = {
   // Info
   async getAppInfo(): Promise<AppInfo> {
     return invoke('get_app_info');
+  },
+
+  // Dialog utilities (Tauri v2 style)
+  async openFile(filters?: { name: string; extensions: string[] }[]): Promise<string | null> {
+    return open({
+      multiple: false,
+      directory: false,
+      filters,
+    }) as Promise<string | null>;
+  },
+
+  async saveFile(defaultPath?: string, filters?: { name: string; extensions: string[] }[]): Promise<string | null> {
+    return save({
+      defaultPath,
+      filters,
+    });
+  },
+
+  async showMessage(title: string, msgText: string, kind?: 'info' | 'warning' | 'error'): Promise<void> {
+    await showDialog(msgText, { title, kind: kind || 'info' });
+  },
+
+  async confirm(title: string, msgText: string): Promise<boolean> {
+    return ask(msgText, { title, kind: 'info' });
   },
 };
 

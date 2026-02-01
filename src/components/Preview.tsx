@@ -33,14 +33,21 @@ export function Preview({ onClose }: PreviewProps) {
   }, [theme]);
 
   const handleExport = useCallback(async () => {
+    console.log('🔹 handleExport called');
     try {
+      console.log('🔹 Opening save dialog...');
       const filePath = await save({
         filters: [{ name: 'Draw.io', extensions: ['drawio'] }],
         defaultPath: 'diagram.drawio',
       });
 
-      if (!filePath) return;
+      console.log('🔹 save() returned:', filePath);
+      if (!filePath) {
+        console.log('❌ Save cancelled or no path returned');
+        return;
+      }
 
+      console.log('🔹 Invoking export_drawio_file with path:', filePath);
       await invoke('export_drawio_file', {
         path: filePath,
         options: {
@@ -52,9 +59,10 @@ export function Preview({ onClose }: PreviewProps) {
         },
       });
 
+      console.log('✅ Export successful!');
       alert(`Exported to ${filePath}`);
     } catch (error) {
-      console.error('Export failed:', error);
+      console.error('❌ Export failed:', error);
       alert(`Export failed: ${error}`);
     }
   }, [theme]);
