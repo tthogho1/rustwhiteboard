@@ -87,7 +87,9 @@ async fn add_stroke(
     stroke: Stroke,
 ) -> Result<(), String> {
     let mut strokes = state.strokes.lock().map_err(|e| e.to_string())?;
+    println!("[STROKE] add_stroke: id={}, points={}, tool={}", stroke.id, stroke.points.len(), stroke.tool);
     strokes.push(stroke);
+    println!("[STROKE] Total strokes now: {}", strokes.len());
     Ok(())
 }
 
@@ -118,6 +120,8 @@ async fn process_canvas(
     width: u32,
     height: u32,
 ) -> Result<ProcessingResult, String> {
+    println!("[PROCESS] process_canvas called with image {}x{}", width, height);
+    
     // Decode base64 image data
     let image_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
@@ -131,18 +135,22 @@ async fn process_canvas(
 
     // Get strokes for shape detection
     let strokes = state.strokes.lock().map_err(|e| e.to_string())?;
+    println!("[PROCESS] Found {} strokes in state", strokes.len());
 
     // Detect shapes from strokes
     let detected_shapes = shapes::detect_shapes(&strokes);
+    println!("[PROCESS] Detected {} shapes", detected_shapes.len());
     
     // Store detected shapes
     {
         let mut shapes_state = state.detected_shapes.lock().map_err(|e| e.to_string())?;
         *shapes_state = detected_shapes.clone();
+        println!("[PROCESS] Stored {} shapes in state", shapes_state.len());
     }
 
     // Perform OCR on the image
     let text_regions = ocr::extract_text(&img, width, height);
+    println!("[PROCESS] Found {} text regions", text_regions.len());
     
     // Store OCR results
     {
@@ -152,6 +160,7 @@ async fn process_canvas(
 
     // Determine diagram type
     let (diagram_type, confidence) = shapes::classify_diagram(&detected_shapes, &text_regions);
+    println!("[PROCESS] Classified as {} with confidence {:.2}", diagram_type, confidence);
 
     Ok(ProcessingResult {
         shapes: detected_shapes,
@@ -197,7 +206,19 @@ async fn generate_drawio(
     let shapes = state.detected_shapes.lock().map_err(|e| e.to_string())?;
     let text_regions = state.ocr_text.lock().map_err(|e| e.to_string())?;
 
-    drawio::generate_xml(&shapes, &text_regions, &options)
+    println!("[DRAWIO] generate_drawio: {} shapes, {} text_regions", shapes.len(), text_regions.len());
+    for shape in shapes.iter() {
+        println!("[DRAWIO]   Shape: {:?} at ({}, {}) {}x{}", 
+            shape.shape_type, shape.bounds.x, shape.bounds.y, 
+            shape.bounds.width, shape.bounds.height);
+    }
+
+    let result = drawio::generate_xml(&shapes, &text_regions, &options);
+    match &result {
+        Ok(xml) => println!("[DRAWIO] Generated XML length: {} bytes", xml.len()),
+        Err(e) => println!("[DRAWIO] Error generating XML: {}", e),
+    }
+    result
 }
 
 /// Export the diagram to a .drawio file
@@ -207,18 +228,19 @@ async fn export_drawio_file(
     path: String,
     options: ExportOptions,
 ) -> Result<(), String> {
-    log::info!("🔹 export_drawio_file called with path: {}", path);
+    println!("[EXPORT] export_drawio_file called with path: {}", path);
 
     let xml = generate_drawio(state, options).await?;
-    log::info!("🔹 Generated {} bytes of XML", xml.len());
+    println!("[EXPORT] Generated {} bytes of XML", xml.len());
+    println!("[EXPORT] XML preview:\n{}", &xml[..xml.len().min(500)]);
 
     std::fs::write(&path, &xml)
         .map_err(|e| {
-            log::error!("❌ Failed to write file: {}", e);
+            println!("[EXPORT] ❌ Failed to write file: {}", e);
             format!("Failed to write file: {}", e)
         })?;
 
-    log::info!("✅ Successfully wrote file to {}", path);
+    println!("[EXPORT] ✅ Successfully wrote file to {}", path);
     Ok(())
 }
 

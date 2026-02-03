@@ -78,9 +78,9 @@ impl Default for DetectionParams {
     fn default() -> Self {
         Self {
             min_points: 5,
-            circularity_threshold: 0.85,
-            rectangularity_threshold: 0.80,
-            line_straightness_threshold: 0.95,
+            circularity_threshold: 0.60,       // フリーハンド用にさらに緩和 (0.70 → 0.60)
+            rectangularity_threshold: 0.50,    // フリーハンド用にさらに緩和 (0.65 → 0.50)
+            line_straightness_threshold: 0.75, // 直線検出を緩和 (0.80 → 0.75)
             arrow_angle_tolerance: 30.0,
         }
     }
@@ -111,54 +111,77 @@ pub fn detect_shapes(strokes: &[Stroke]) -> Vec<DetectedShape> {
 /// Detect a single shape from a stroke
 fn detect_shape_from_stroke(stroke: &Stroke, params: &DetectionParams) -> Option<DetectedShape> {
     let points = &stroke.points;
-    
+
+    // Log the input stroke details
+    log::debug!("Processing stroke with {} points", points.len());
+
     // Calculate basic metrics
     let bounds = calculate_bounds(points);
     let center = calculate_centroid(points);
-    let is_closed = is_stroke_closed(points, bounds.width.max(bounds.height) * 0.1);
 
-    // Try to identify the shape type
-    let (shape_type, confidence) = if is_closed {
-        // Check for circle first
-        let circularity = calculate_circularity(points, &center);
-        if circularity > params.circularity_threshold {
-            (ShapeType::Circle, circularity)
-        } else {
-            // Check for rectangle
-            let rectangularity = calculate_rectangularity(points, &bounds);
-            if rectangularity > params.rectangularity_threshold {
-                // Check if it's a diamond (rotated 45 degrees)
-                let is_diamond = check_diamond(points, &center);
-                if is_diamond {
-                    (ShapeType::Diamond, rectangularity * 0.95)
-                } else {
-                    (ShapeType::Rectangle, rectangularity)
-                }
-            } else {
-                // Check for triangle
-                let triangle_score = calculate_triangle_score(points);
-                if triangle_score > 0.75 {
-                    (ShapeType::Triangle, triangle_score)
-                } else {
-                    (ShapeType::Freeform, 0.5)
-                }
-            }
-        }
-    } else {
-        // Open stroke - check for line or arrow
-        let straightness = calculate_straightness(points);
-        if straightness > params.line_straightness_threshold {
-            // Check for arrow head
-            if let Some(arrow_info) = detect_arrow_head(points, params.arrow_angle_tolerance) {
+    // Log calculated bounds and center
+    log::debug!("Bounds: x={}, y={}, width={}, height={}", bounds.x, bounds.y, bounds.width, bounds.height);
+    log::debug!("Center: x={}, y={}", center.0, center.1);
+
+    // 閉じたストロークの判定（閾値を緩和）
+    let close_threshold = bounds.width.max(bounds.height) * 0.15; // 0.1 → 0.15
+    let is_closed = is_stroke_closed(points, close_threshold);
+
+    // 各スコアを計算
+    let circularity = calculate_circularity(points, &center);
+    let rectangularity = calculate_rectangularity(points, &bounds);
+    let straightness = calculate_straightness(points);
+
+    // Log calculated metrics - use println! for direct output
+    println!("[SHAPE] Stroke {} points, bounds: ({:.0}, {:.0}, {:.0}x{:.0})", 
+        points.len(), bounds.x, bounds.y, bounds.width, bounds.height);
+    println!("[SHAPE] Metrics: closed={}, circularity={:.2}, rectangularity={:.2}, straightness={:.2}", 
+        is_closed, circularity, rectangularity, straightness);
+    println!("[SHAPE] Line check: !is_closed={}, straightness({:.2}) > threshold({:.2}) = {}",
+        !is_closed, straightness, params.line_straightness_threshold, 
+        straightness > params.line_straightness_threshold);
+    
+    let (shape_type, confidence) = {
+        // 開いたストロークの場合、まず直線/矢印をチェック（矩形より優先）
+        if !is_closed && straightness > params.line_straightness_threshold {
+            println!("[SHAPE] → Detected as LINE or ARROW (open stroke with high straightness)");
+            if let Some(_arrow_info) = detect_arrow_head(points, params.arrow_angle_tolerance) {
                 (ShapeType::Arrow, straightness * 0.95)
             } else {
                 (ShapeType::Line, straightness)
             }
+        } else if circularity > params.circularity_threshold && (is_closed || circularity > 0.8) {
+            println!("[SHAPE] → Detected as CIRCLE (high circularity)");
+            // 円形度が高ければ円として判定（ダイヤモンドより優先）
+            (ShapeType::Circle, circularity)
+        } else if rectangularity > params.rectangularity_threshold && is_closed {
+            println!("[SHAPE] → Detected as RECTANGLE or DIAMOND (closed with high rectangularity)");
+            // 閉じたストロークで矩形スコアが高い場合
+            // ダイヤモンド判定は円形度が低い場合のみ（円をダイヤモンドと誤判定しないため）
+            let is_diamond = circularity < 0.5 && check_diamond(points, &center);
+            if is_diamond {
+                (ShapeType::Diamond, rectangularity * 0.95)
+            } else {
+                (ShapeType::Rectangle, rectangularity)
+            }
+        } else if is_closed {
+            println!("[SHAPE] → Detected as TRIANGLE or FREEFORM (closed but not rect/circle)");
+            // 閉じているが矩形でも円でもない場合
+            let triangle_score = calculate_triangle_score(points);
+            if triangle_score > 0.75 {
+                (ShapeType::Triangle, triangle_score)
+            } else {
+                (ShapeType::Freeform, 0.5)
+            }
         } else {
-            // Could be a connector (curved line between shapes)
+            println!("[SHAPE] → Detected as CONNECTOR (open with low straightness={:.2})", straightness);
+            // 開いたストロークで直線度が低い場合 - コネクタ
             (ShapeType::Connector, 0.6)
         }
     };
+
+    // Log detected shape type and confidence
+    println!("[SHAPE] Final result: {:?} with confidence {:.2}", shape_type, confidence);
 
     let properties = ShapeProperties {
         center_x: center.0,
@@ -227,10 +250,13 @@ fn is_stroke_closed(points: &[Point], threshold: f64) -> bool {
     let start = &points[0];
     let end = &points[points.len() - 1];
     let distance = ((start.x - end.x).powi(2) + (start.y - end.y).powi(2)).sqrt();
-    distance < threshold
+    // 最大閾値を設定してフリーハンド誤判定を防ぐ
+    let max_threshold = 50.0;
+    distance < threshold.min(max_threshold)
 }
 
 /// Calculate circularity (how close to a circle)
+/// サンプリングを使用してフリーハンドのノイズを軽減
 fn calculate_circularity(points: &[Point], center: &(f64, f64)) -> f64 {
     let avg_radius = calculate_average_radius(points, center);
     
@@ -238,20 +264,24 @@ fn calculate_circularity(points: &[Point], center: &(f64, f64)) -> f64 {
         return 0.0;
     }
 
-    let variance: f64 = points
+    // サンプリングしてノイズを減らす（最大20点）
+    let sample_step = (points.len() / 20).max(1);
+    let sampled: Vec<_> = points.iter().step_by(sample_step).collect();
+
+    let variance: f64 = sampled
         .iter()
         .map(|p| {
             let r = ((p.x - center.0).powi(2) + (p.y - center.1).powi(2)).sqrt();
             (r - avg_radius).powi(2)
         })
         .sum::<f64>()
-        / points.len() as f64;
+        / sampled.len() as f64;
 
     let std_dev = variance.sqrt();
     let coefficient_of_variation = std_dev / avg_radius;
     
-    // Lower variation = more circular
-    (1.0 - coefficient_of_variation).max(0.0).min(1.0)
+    // フリーハンド用に許容範囲を広げる（係数を2倍にして緩和）
+    (1.0 - coefficient_of_variation * 2.0).max(0.0).min(1.0)
 }
 
 /// Calculate average radius from center
@@ -264,22 +294,38 @@ fn calculate_average_radius(points: &[Point], center: &(f64, f64)) -> f64 {
 }
 
 /// Calculate rectangularity (how close to a rectangle)
+/// 辺に沿ったポイント分布とコーナー検出を組み合わせて判定
 fn calculate_rectangularity(points: &[Point], bounds: &ShapeBounds) -> f64 {
     let area = bounds.width * bounds.height;
     if area == 0.0 {
         return 0.0;
     }
 
-    // Calculate convex hull area
-    let hull_area = calculate_convex_hull_area(points);
+    // ポイントがバウンディングボックスの辺に沿っているかをチェック
+    let edge_threshold = bounds.width.max(bounds.height) * 0.15;
+    let mut on_edge_count = 0;
+
+    for p in points {
+        let near_left = (p.x - bounds.x).abs() < edge_threshold;
+        let near_right = (p.x - (bounds.x + bounds.width)).abs() < edge_threshold;
+        let near_top = (p.y - bounds.y).abs() < edge_threshold;
+        let near_bottom = (p.y - (bounds.y + bounds.height)).abs() < edge_threshold;
+
+        if near_left || near_right || near_top || near_bottom {
+            on_edge_count += 1;
+        }
+    }
+
+    let edge_ratio = on_edge_count as f64 / points.len() as f64;
     
-    // Perfect rectangle has hull area equal to bounding box area
-    let ratio = hull_area / area;
-    
-    // Also check for corner presence
+    // アスペクト比もチェック（極端に細長いものは除外）
+    let aspect = bounds.width.min(bounds.height) / bounds.width.max(bounds.height);
+    let aspect_score = if aspect > 0.3 { 1.0 } else { aspect / 0.3 };
+
+    // コーナー検出スコア
     let corner_score = detect_corners(points, bounds);
-    
-    (ratio * 0.6 + corner_score * 0.4).min(1.0)
+
+    (edge_ratio * 0.4 + corner_score * 0.4 + aspect_score * 0.2).min(1.0)
 }
 
 /// Simplified convex hull area calculation
@@ -327,26 +373,43 @@ fn detect_corners(points: &[Point], bounds: &ShapeBounds) -> f64 {
 
 /// Check if shape is a diamond (rhombus)
 fn check_diamond(points: &[Point], center: &(f64, f64)) -> bool {
-    // A diamond has points at cardinal directions from center
+    // A diamond has points clustered at cardinal directions (corners), not distributed evenly like a circle
     let mut cardinal_scores = [0.0; 4]; // top, right, bottom, left
+    let mut diagonal_scores = [0.0; 4]; // top-right, bottom-right, bottom-left, top-left
     
     for point in points {
         let dx = point.x - center.0;
         let dy = point.y - center.1;
         let angle = dy.atan2(dx);
         
-        // Check proximity to cardinal directions
-        let angles = [-PI / 2.0, 0.0, PI / 2.0, PI];
-        for (i, &target_angle) in angles.iter().enumerate() {
+        // Check proximity to cardinal directions (diamond corners)
+        let cardinal_angles = [-PI / 2.0, 0.0, PI / 2.0, PI];
+        for (i, &target_angle) in cardinal_angles.iter().enumerate() {
             let diff = (angle - target_angle).abs();
-            if diff < PI / 6.0 || (PI - diff).abs() < PI / 6.0 {
+            if diff < PI / 8.0 || (PI - diff).abs() < PI / 8.0 {
                 cardinal_scores[i] += 1.0;
+            }
+        }
+        
+        // Check proximity to diagonal directions (should be low for diamond)
+        let diagonal_angles = [-PI / 4.0, PI / 4.0, 3.0 * PI / 4.0, -3.0 * PI / 4.0];
+        for (i, &target_angle) in diagonal_angles.iter().enumerate() {
+            let diff = (angle - target_angle).abs();
+            if diff < PI / 8.0 || (PI - diff).abs() < PI / 8.0 {
+                diagonal_scores[i] += 1.0;
             }
         }
     }
 
-    // Diamond should have points clustered at all 4 cardinal directions
-    cardinal_scores.iter().all(|&s| s > 0.0)
+    let total_cardinal: f64 = cardinal_scores.iter().sum();
+    let total_diagonal: f64 = diagonal_scores.iter().sum();
+    
+    // Diamond should have significantly more points at cardinal directions than diagonals
+    // And should have points at all 4 cardinal directions
+    let has_all_cardinals = cardinal_scores.iter().all(|&s| s > 0.0);
+    let cardinal_dominant = total_cardinal > total_diagonal * 1.5;
+    
+    has_all_cardinals && cardinal_dominant
 }
 
 /// Calculate triangle score

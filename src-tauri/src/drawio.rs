@@ -337,14 +337,20 @@ fn write_connectors(
         let current_id = cell_id.to_string();
         let style = get_connector_style(&shape.shape_type);
 
-        write_edge_cell(
+        // Get start and end points for standalone lines (not connected to shapes)
+        let start_point = shape.properties.start_point;
+        let end_point = shape.properties.end_point;
+
+        write_edge_cell_with_points(
             writer,
             &current_id,
             "1",
             "",
             &style,
-            &source_id.unwrap_or_default(),
-            &target_id.unwrap_or_default(),
+            source_id.as_deref(),
+            target_id.as_deref(),
+            start_point,
+            end_point,
         )?;
 
         *cell_id += 1;
@@ -353,7 +359,104 @@ fn write_connectors(
     Ok(())
 }
 
-/// Write an edge cell
+/// Write an edge cell with explicit start/end points for standalone lines
+fn write_edge_cell_with_points(
+    writer: &mut Writer<Cursor<Vec<u8>>>,
+    id: &str,
+    parent: &str,
+    value: &str,
+    style: &str,
+    source: Option<&str>,
+    target: Option<&str>,
+    start_point: Option<(f64, f64)>,
+    end_point: Option<(f64, f64)>,
+) -> Result<(), String> {
+    let mut cell = BytesStart::new("mxCell");
+    cell.push_attribute(("id", id));
+    cell.push_attribute(("value", value));
+    cell.push_attribute(("style", style));
+    cell.push_attribute(("edge", "1"));
+    cell.push_attribute(("parent", parent));
+    
+    // Only add source/target if they exist
+    if let Some(src) = source {
+        if !src.is_empty() {
+            cell.push_attribute(("source", src));
+        }
+    }
+    if let Some(tgt) = target {
+        if !tgt.is_empty() {
+            cell.push_attribute(("target", tgt));
+        }
+    }
+    
+    writer
+        .write_event(Event::Start(cell))
+        .map_err(|e| e.to_string())?;
+
+    // For standalone lines (no source/target), use absolute geometry with points
+    let is_standalone = source.map_or(true, |s| s.is_empty()) && target.map_or(true, |t| t.is_empty());
+    
+    if is_standalone {
+        if let (Some((sx, sy)), Some((ex, ey))) = (start_point, end_point) {
+            // Use absolute positioning with mxPoint elements
+            let mut geometry = BytesStart::new("mxGeometry");
+            geometry.push_attribute(("relative", "1"));
+            geometry.push_attribute(("as", "geometry"));
+            writer
+                .write_event(Event::Start(geometry))
+                .map_err(|e| e.to_string())?;
+            
+            // Source point (absolute)
+            let sx_str = format!("{:.0}", sx);
+            let sy_str = format!("{:.0}", sy);
+            let mut source_pt = BytesStart::new("mxPoint");
+            source_pt.push_attribute(("x", sx_str.as_str()));
+            source_pt.push_attribute(("y", sy_str.as_str()));
+            source_pt.push_attribute(("as", "sourcePoint"));
+            writer
+                .write_event(Event::Empty(source_pt))
+                .map_err(|e| e.to_string())?;
+            
+            // Target point (absolute)
+            let ex_str = format!("{:.0}", ex);
+            let ey_str = format!("{:.0}", ey);
+            let mut target_pt = BytesStart::new("mxPoint");
+            target_pt.push_attribute(("x", ex_str.as_str()));
+            target_pt.push_attribute(("y", ey_str.as_str()));
+            target_pt.push_attribute(("as", "targetPoint"));
+            writer
+                .write_event(Event::Empty(target_pt))
+                .map_err(|e| e.to_string())?;
+            
+            writer
+                .write_event(Event::End(BytesEnd::new("mxGeometry")))
+                .map_err(|e| e.to_string())?;
+        } else {
+            // Fallback: relative geometry
+            let mut geometry = BytesStart::new("mxGeometry");
+            geometry.push_attribute(("relative", "1"));
+            geometry.push_attribute(("as", "geometry"));
+            writer
+                .write_event(Event::Empty(geometry))
+                .map_err(|e| e.to_string())?;
+        }
+    } else {
+        // Connected edge: use relative geometry
+        let mut geometry = BytesStart::new("mxGeometry");
+        geometry.push_attribute(("relative", "1"));
+        geometry.push_attribute(("as", "geometry"));
+        writer
+            .write_event(Event::Empty(geometry))
+            .map_err(|e| e.to_string())?;
+    }
+
+    writer
+        .write_event(Event::End(BytesEnd::new("mxCell")))
+        .map_err(|e| e.to_string())
+}
+
+/// Write an edge cell (legacy - kept for compatibility)
 fn write_edge_cell(
     writer: &mut Writer<Cursor<Vec<u8>>>,
     id: &str,
@@ -363,33 +466,12 @@ fn write_edge_cell(
     source: &str,
     target: &str,
 ) -> Result<(), String> {
-    let mut cell = BytesStart::new("mxCell");
-    cell.push_attribute(("id", id));
-    cell.push_attribute(("value", value));
-    cell.push_attribute(("style", style));
-    cell.push_attribute(("edge", "1"));
-    cell.push_attribute(("parent", parent));
-    if !source.is_empty() {
-        cell.push_attribute(("source", source));
-    }
-    if !target.is_empty() {
-        cell.push_attribute(("target", target));
-    }
-    writer
-        .write_event(Event::Start(cell))
-        .map_err(|e| e.to_string())?;
-
-    // Geometry for edge
-    let mut geometry = BytesStart::new("mxGeometry");
-    geometry.push_attribute(("relative", "1"));
-    geometry.push_attribute(("as", "geometry"));
-    writer
-        .write_event(Event::Empty(geometry))
-        .map_err(|e| e.to_string())?;
-
-    writer
-        .write_event(Event::End(BytesEnd::new("mxCell")))
-        .map_err(|e| e.to_string())
+    write_edge_cell_with_points(
+        writer, id, parent, value, style,
+        if source.is_empty() { None } else { Some(source) },
+        if target.is_empty() { None } else { Some(target) },
+        None, None,
+    )
 }
 
 /// Find label text that belongs to a shape
