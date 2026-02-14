@@ -89,14 +89,14 @@ fn extract_text_tesseract(image: &DynamicImage) -> Result<Vec<TextRegion>, Strin
     let mut png_bytes = Vec::new();
     
     let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
-    encoder
-        .encode(
-            gray.as_raw(),
-            gray.width(),
-            gray.height(),
-            image::ColorType::L8.into(),
-        )
-        .map_err(|e| format!("Failed to encode image: {}", e))?;
+    image::ImageEncoder::write_image(
+        encoder,
+        gray.as_raw(),
+        gray.width(),
+        gray.height(),
+        image::ExtendedColorType::L8,
+    )
+    .map_err(|e| format!("Failed to encode image: {}", e))?;
 
     // Initialize Tesseract
     let mut tess = Tesseract::new(None, Some("eng"))
