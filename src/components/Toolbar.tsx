@@ -103,6 +103,7 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
         prompt: llmPrompt,
       });
       console.log('LLM Enhancement result:', result);
+      setProcessingResult(result as any);
       alert('LLM processing completed! Check the preview.');
       onTogglePreview();
     } catch (error) {
@@ -114,6 +115,11 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
   }, [strokes, llmPrompt, setProcessing, onTogglePreview]);
 
   const handleExport = useCallback(async () => {
+    if (strokes.length === 0) {
+      alert('Please draw something first!');
+      return;
+    }
+
     try {
       const filePath = await save({
         filters: [
@@ -126,6 +132,20 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
       });
 
       if (!filePath) return;
+
+      // Ensure backend has the strokes and detected shapes before exporting
+      const canvas = document.querySelector('.drawing-canvas') as HTMLCanvasElement;
+      if (canvas) {
+        const imageData = canvas.toDataURL('image/png');
+        for (const stroke of strokes) {
+          await invoke('add_stroke', { stroke });
+        }
+        await invoke('process_canvas', {
+          imageData,
+          width: canvas.width,
+          height: canvas.height,
+        });
+      }
 
       await invoke('export_drawio_file', {
         path: filePath,
@@ -143,7 +163,7 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
       console.error('Export failed:', error);
       alert(`Export failed: ${error}`);
     }
-  }, [theme]);
+  }, [strokes, theme]);
 
   const handleSaveBackup = useCallback(async () => {
     try {

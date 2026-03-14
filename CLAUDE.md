@@ -11,13 +11,16 @@ RustWhiteboard is a Tauri v2 desktop application that converts hand-drawn diagra
 ### Frontend + Backend Development
 ```bash
 # Run in development mode (starts Vite dev server + Tauri)
-npm run tauri dev
+npm run tauri:dev
 
 # Build the frontend only
 npm run build
 
-# Preview the production frontend build
+# Preview the production frontend build (browser only, no Tauri)
 npm run preview
+
+# Run frontend only in browser (NOT recommended - Tauri APIs won't work)
+npm run dev
 ```
 
 ### Rust Backend
@@ -45,7 +48,7 @@ cargo check
 ### Production Build
 ```bash
 # Create production bundle for current platform
-npm run tauri build
+npm run tauri:build
 ```
 
 Note: Production builds require platform-specific Tauri prerequisites (code signing certificates, etc.).

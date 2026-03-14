@@ -7,6 +7,7 @@ use crate::{Point, Stroke};
 use crate::ocr::TextRegion;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
+use geo::{LineString, Simplify};
 
 /// Types of shapes that can be detected
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -108,23 +109,76 @@ pub fn detect_shapes(strokes: &[Stroke]) -> Vec<DetectedShape> {
     merge_shapes(shapes, compound_shapes)
 }
 
+/// Smooth a stroke using a moving average to reduce freehand jitter.
+/// Runs `passes` times; 2 passes works well for typical freehand noise.
+fn smooth_stroke(points: &[Point], window: usize, passes: usize) -> Vec<Point> {
+    let mut pts: Vec<Point> = points.to_vec();
+    let half = window / 2;
+    for _ in 0..passes {
+        let src = pts.clone();
+        for i in 0..src.len() {
+            let lo = i.saturating_sub(half);
+            let hi = (i + half + 1).min(src.len());
+            let count = (hi - lo) as f64;
+            let sx: f64 = src[lo..hi].iter().map(|p| p.x).sum();
+            let sy: f64 = src[lo..hi].iter().map(|p| p.y).sum();
+            pts[i].x = sx / count;
+            pts[i].y = sy / count;
+        }
+    }
+    pts
+}
+
+/// Simplify a stroke with Ramer-Douglas-Peucker, removing near-collinear points.
+/// `epsilon` is adaptive: ~1.5% of the larger bounding dimension.
+fn simplify_stroke(points: &[Point]) -> Vec<Point> {
+    if points.len() < 4 {
+        return points.to_vec();
+    }
+
+    // Compute adaptive epsilon from bounding box
+    let min_x = points.iter().map(|p| p.x).fold(f64::MAX, f64::min);
+    let max_x = points.iter().map(|p| p.x).fold(f64::MIN, f64::max);
+    let min_y = points.iter().map(|p| p.y).fold(f64::MAX, f64::min);
+    let max_y = points.iter().map(|p| p.y).fold(f64::MIN, f64::max);
+    let max_dim = (max_x - min_x).max(max_y - min_y);
+    let epsilon = (max_dim * 0.015).max(1.5); // at least 1.5 px
+
+    let line: LineString<f64> = points
+        .iter()
+        .map(|p| geo::coord! { x: p.x, y: p.y })
+        .collect();
+
+    let simplified = line.simplify(&epsilon);
+
+    simplified
+        .coords()
+        .map(|c| Point { x: c.x, y: c.y, pressure: None, timestamp: 0 })
+        .collect()
+}
+
 /// Detect a single shape from a stroke
 fn detect_shape_from_stroke(stroke: &Stroke, params: &DetectionParams) -> Option<DetectedShape> {
-    let points = &stroke.points;
+    let raw_points = &stroke.points;
 
-    // Log the input stroke details
-    log::debug!("Processing stroke with {} points", points.len());
+    // --- Pre-processing pipeline ---
+    // 1. Smooth to remove freehand jitter (3-point window, 2 passes)
+    let smoothed = smooth_stroke(raw_points, 3, 2);
+    // 2. Simplify with RDP to collapse near-collinear points
+    let points_vec = simplify_stroke(&smoothed);
+    let points = &points_vec;
 
-    // Calculate basic metrics
+    log::debug!(
+        "Stroke pre-process: {} raw → {} smoothed → {} simplified points",
+        raw_points.len(), smoothed.len(), points.len()
+    );
+
+    // Calculate basic metrics on the cleaned stroke
     let bounds = calculate_bounds(points);
     let center = calculate_centroid(points);
 
-    // Log calculated bounds and center
-    log::debug!("Bounds: x={}, y={}, width={}, height={}", bounds.x, bounds.y, bounds.width, bounds.height);
-    log::debug!("Center: x={}, y={}", center.0, center.1);
-
     // 閉じたストロークの判定（閾値を緩和）
-    let close_threshold = bounds.width.max(bounds.height) * 0.15; // 0.1 → 0.15
+    let close_threshold = bounds.width.max(bounds.height) * 0.15;
     let is_closed = is_stroke_closed(points, close_threshold);
 
     // 各スコアを計算
@@ -132,13 +186,24 @@ fn detect_shape_from_stroke(stroke: &Stroke, params: &DetectionParams) -> Option
     let rectangularity = calculate_rectangularity(points, &bounds);
     let straightness = calculate_straightness(points);
 
-    // Log calculated metrics - use println! for direct output
-    println!("[SHAPE] Stroke {} points, bounds: ({:.0}, {:.0}, {:.0}x{:.0})", 
-        points.len(), bounds.x, bounds.y, bounds.width, bounds.height);
-    println!("[SHAPE] Metrics: closed={}, circularity={:.2}, rectangularity={:.2}, straightness={:.2}", 
-        is_closed, circularity, rectangularity, straightness);
+    // Count sharp corners to disambiguate circle vs square/rectangle.
+    // A true circle has 0–1 sharp corners; a freehand square typically has 3–4.
+    let sharp_corners = count_sharp_corners(points, 45.0);
+    let adjusted_circularity = if sharp_corners >= 3 {
+        // Strong corner evidence → suppress circularity significantly
+        circularity * (1.0 - (sharp_corners as f64 - 2.0) * 0.25).max(0.0)
+    } else if sharp_corners == 2 {
+        circularity * 0.75
+    } else {
+        circularity
+    };
+
+    println!("[SHAPE] Stroke {} raw→{} simplified, bounds: ({:.0}, {:.0}, {:.0}x{:.0})",
+        raw_points.len(), points.len(), bounds.x, bounds.y, bounds.width, bounds.height);
+    println!("[SHAPE] Metrics: closed={}, circularity={:.2}, adjusted_circularity={:.2} (sharp_corners={}), rectangularity={:.2}, straightness={:.2}",
+        is_closed, circularity, adjusted_circularity, sharp_corners, rectangularity, straightness);
     println!("[SHAPE] Line check: !is_closed={}, straightness({:.2}) > threshold({:.2}) = {}",
-        !is_closed, straightness, params.line_straightness_threshold, 
+        !is_closed, straightness, params.line_straightness_threshold,
         straightness > params.line_straightness_threshold);
     
     let (shape_type, confidence) = {
@@ -150,10 +215,10 @@ fn detect_shape_from_stroke(stroke: &Stroke, params: &DetectionParams) -> Option
             } else {
                 (ShapeType::Line, straightness)
             }
-        } else if circularity > params.circularity_threshold && (is_closed || circularity > 0.8) {
-            println!("[SHAPE] → Detected as CIRCLE (high circularity)");
+        } else if adjusted_circularity > params.circularity_threshold && (is_closed || adjusted_circularity > 0.8) {
+            println!("[SHAPE] → Detected as CIRCLE (high adjusted_circularity={:.2}, sharp_corners={})", adjusted_circularity, sharp_corners);
             // 円形度が高ければ円として判定（ダイヤモンドより優先）
-            (ShapeType::Circle, circularity)
+            (ShapeType::Circle, adjusted_circularity)
         } else if rectangularity > params.rectangularity_threshold && is_closed {
             println!("[SHAPE] → Detected as RECTANGLE or DIAMOND (closed with high rectangularity)");
             // 閉じたストロークで矩形スコアが高い場合
@@ -191,8 +256,8 @@ fn detect_shape_from_stroke(stroke: &Stroke, params: &DetectionParams) -> Option
         } else {
             None
         },
-        start_point: Some((points.first()?.x, points.first()?.y)),
-        end_point: Some((points.last()?.x, points.last()?.y)),
+        start_point: Some((raw_points.first()?.x, raw_points.first()?.y)),
+        end_point: Some((raw_points.last()?.x, raw_points.last()?.y)),
         corner_radius: None,
         arrow_head: if shape_type == ShapeType::Arrow {
             detect_arrow_head(points, params.arrow_angle_tolerance)
@@ -253,6 +318,39 @@ fn is_stroke_closed(points: &[Point], threshold: f64) -> bool {
     // 最大閾値を設定してフリーハンド誤判定を防ぐ
     let max_threshold = 50.0;
     distance < threshold.min(max_threshold)
+}
+
+/// Count sharp corners (direction changes exceeding `angle_threshold_deg` degrees).
+/// Used to distinguish squares/rectangles from circles after smoothing.
+fn count_sharp_corners(points: &[Point], angle_threshold_deg: f64) -> usize {
+    if points.len() < 3 {
+        return 0;
+    }
+    let threshold = angle_threshold_deg.to_radians();
+    // Adaptive look-ahead window: ~5% of total points, at least 2
+    let window = (points.len() / 20).max(2);
+    let mut count = 0;
+    let mut i = window;
+    while i < points.len().saturating_sub(window) {
+        let prev = &points[i - window];
+        let curr = &points[i];
+        let next = &points[i + window];
+
+        let a1 = (curr.y - prev.y).atan2(curr.x - prev.x);
+        let a2 = (next.y - curr.y).atan2(next.x - curr.x);
+        let mut diff = (a2 - a1).abs();
+        if diff > PI {
+            diff = (2.0 * PI) - diff;
+        }
+
+        if diff > threshold {
+            count += 1;
+            i += window; // skip ahead to avoid counting the same corner twice
+        } else {
+            i += 1;
+        }
+    }
+    count
 }
 
 /// Calculate circularity (how close to a circle)
