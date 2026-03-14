@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { open, save, message as showDialog, ask } from '@tauri-apps/plugin-dialog';
 import type { Stroke, ProcessingResult } from '../store';
 
@@ -31,55 +31,62 @@ export interface AppInfo {
 }
 
 // Tauri API wrapper functions
+function safeInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (typeof window !== 'undefined' && !(window as any).__TAURI_INTERNALS__) {
+    return Promise.reject(new Error('Tauri API not available. Start the app with `npm run tauri:dev`.'));
+  }
+  return tauriInvoke<T>(cmd, args);
+}
+
 export const api = {
   // Stroke management
   async addStroke(stroke: Stroke): Promise<void> {
-    return invoke('add_stroke', { stroke });
+    return safeInvoke('add_stroke', { stroke });
   },
 
   async clearStrokes(): Promise<void> {
-    return invoke('clear_strokes');
+    return safeInvoke('clear_strokes');
   },
 
   async getStrokes(): Promise<Stroke[]> {
-    return invoke('get_strokes');
+    return safeInvoke('get_strokes');
   },
 
   // Processing
   async processCanvas(imageData: string, width: number, height: number): Promise<ProcessingResult> {
-    return invoke('process_canvas', { imageData, width, height });
+    return safeInvoke('process_canvas', { imageData, width, height });
   },
 
   // LLM
   async enhanceWithLlm(prompt?: string): Promise<unknown> {
-    return invoke('enhance_with_llm', { prompt });
+    return safeInvoke('enhance_with_llm', { prompt });
   },
 
   async configureLlm(config: LlmConfig): Promise<void> {
-    return invoke('configure_llm', { config });
+    return safeInvoke('configure_llm', { config });
   },
 
   // Export
   async generateDrawio(options: ExportOptions): Promise<string> {
-    return invoke('generate_drawio', { options });
+    return safeInvoke('generate_drawio', { options });
   },
 
   async exportDrawioFile(path: string, options: ExportOptions): Promise<void> {
-    return invoke('export_drawio_file', { path, options });
+    return safeInvoke('export_drawio_file', { path, options });
   },
 
   // Backup
   async saveBackup(path: string): Promise<void> {
-    return invoke('save_backup', { path });
+    return safeInvoke('save_backup', { path });
   },
 
   async loadBackup(path: string): Promise<Stroke[]> {
-    return invoke('load_backup', { path });
+    return safeInvoke('load_backup', { path });
   },
 
   // Info
   async getAppInfo(): Promise<AppInfo> {
-    return invoke('get_app_info');
+    return safeInvoke('get_app_info');
   },
 
   // Dialog utilities (Tauri v2 style)
