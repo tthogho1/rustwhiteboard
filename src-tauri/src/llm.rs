@@ -18,6 +18,7 @@ pub struct LlmConfig {
     pub max_tokens: usize,
     pub context_size: usize,
     pub ollama_url: Option<String>,
+    pub api_key: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -30,6 +31,7 @@ impl Default for LlmConfig {
             max_tokens: 2048,
             context_size: 4096,
             ollama_url: Some("http://localhost:11434".to_string()),
+            api_key: None,
         }
     }
 }
@@ -41,6 +43,7 @@ pub enum LlmBackend {
     Builtin,   // Built-in rule-based processing
     Local,     // Local GGUF model via llm crate
     Ollama,    // Ollama API
+    OpenAI,    // OpenAI API (GPT-4, etc.)
     Disabled,  // No LLM processing
 }
 
@@ -80,6 +83,17 @@ pub async fn enhance_diagram(
             #[cfg(not(feature = "ollama"))]
             {
                 Err("Ollama feature not enabled".to_string())
+            }
+        }
+        LlmBackend::OpenAI => {
+            // Use OpenAI API
+            #[cfg(feature = "openai")]
+            {
+                enhance_with_openai(shapes, text_regions, prompt, &context, config).await
+            }
+            #[cfg(not(feature = "openai"))]
+            {
+                Err("OpenAI feature not enabled. Rebuild with --features openai".to_string())
             }
         }
         LlmBackend::Disabled => {
@@ -252,6 +266,81 @@ async fn enhance_with_ollama(
     // Try to parse as JSON, fall back to rules if parsing fails
     parse_llm_output(content, shapes, text_regions)
         .or_else(|_| enhance_with_rules(shapes, text_regions, context))
+}
+
+/// Enhance diagram using OpenAI API (GPT-4, etc.)
+#[cfg(feature = "openai")]
+async fn enhance_with_openai(
+    shapes: &[DetectedShape],
+    text_regions: &[TextRegion],
+    prompt: &str,
+    context: &str,
+    config: &LlmConfig,
+) -> Result<DiagramStructure, String> {
+    let api_key = config.api_key.as_ref()
+        .ok_or("OpenAI API key not configured. Set api_key in LlmConfig.")?;
+
+    let model = if config.model_name.is_empty() {
+        "gpt-4o"
+    } else {
+        &config.model_name
+    };
+
+    log::info!("Calling OpenAI API with model: {}", model);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": format!(
+                        "Diagram context:\n{}\n\nUser request: {}",
+                        context,
+                        if prompt.is_empty() { "Enhance this diagram" } else { prompt }
+                    )
+                }
+            ],
+            "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
+            "response_format": { "type": "json_object" }
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI request failed: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenAI API error ({}): {}", status, error_body));
+    }
+
+    let result: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
+
+    let content = result["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or("No response content from OpenAI")?;
+
+    log::info!("OpenAI response received ({} chars)", content.len());
+
+    // Try to parse the JSON response into DiagramStructure;
+    // fall back to rule-based if parsing fails
+    parse_llm_output(content, shapes, text_regions)
+        .or_else(|e| {
+            log::warn!("Failed to parse OpenAI output: {}. Falling back to rules.", e);
+            enhance_with_rules(shapes, text_regions, context)
+        })
 }
 
 /// System prompt for diagram enhancement

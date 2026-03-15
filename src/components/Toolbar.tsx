@@ -1,7 +1,9 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useState, useRef } from 'react';
 import { useStore, Tool } from '../store';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
+import { api } from '../lib/api';
+import type { LlmConfig } from '../lib/api';
 
 interface ToolbarProps {
   onTogglePreview: () => void;
@@ -36,6 +38,14 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
   const [llmPrompt, setLlmPrompt] = useState(
     'Convert this hand-drawn flowchart to a clean UML diagram'
   );
+
+  // LLM configuration state
+  const [showLlmSettings, setShowLlmSettings] = useState(false);
+  const [llmBackend, setLlmBackend] = useState<LlmConfig['backend']>('builtin');
+  const [llmApiKey, setLlmApiKey] = useState('');
+  const [llmModelName, setLlmModelName] = useState('gpt-4o');
+  const [llmConfigured, setLlmConfigured] = useState(false);
+  const settingsBtnRef = useRef<HTMLButtonElement>(null);
 
   const tools: { id: Tool; icon: string; label: string }[] = [
     { id: 'pen', icon: '✏️', label: 'Pen' },
@@ -91,14 +101,61 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
     }
   }, [strokes, setProcessing, setProcessingResult, onTogglePreview]);
 
+  const handleConfigureLlm = useCallback(async () => {
+    try {
+      const config: LlmConfig = {
+        backend: llmBackend,
+        model_name: llmModelName,
+        temperature: 0.7,
+        max_tokens: 2048,
+        context_size: 4096,
+        ...(llmBackend === 'openai' && llmApiKey ? { api_key: llmApiKey } : {}),
+        ...(llmBackend === 'ollama' ? { ollama_url: 'http://localhost:11434' } : {}),
+      };
+      await api.configureLlm(config);
+      setLlmConfigured(true);
+      setShowLlmSettings(false);
+      alert(`LLM configured: ${llmBackend} / ${llmModelName}`);
+    } catch (error) {
+      console.error('LLM configuration failed:', error);
+      alert(`LLM configuration failed: ${error}`);
+    }
+  }, [llmBackend, llmApiKey, llmModelName]);
+
   const handleEnhanceWithLLM = useCallback(async () => {
     if (strokes.length === 0) {
       alert('Please draw something first!');
       return;
     }
 
+    // Auto-configure if not yet configured
+    if (!llmConfigured) {
+      try {
+        const config: LlmConfig = {
+          backend: llmBackend,
+          model_name: llmModelName,
+          temperature: 0.7,
+          max_tokens: 2048,
+          context_size: 4096,
+          ...(llmBackend === 'openai' && llmApiKey ? { api_key: llmApiKey } : {}),
+          ...(llmBackend === 'ollama' ? { ollama_url: 'http://localhost:11434' } : {}),
+        };
+        await api.configureLlm(config);
+        setLlmConfigured(true);
+      } catch (error) {
+        console.error('LLM auto-configure failed:', error);
+        alert(`LLM configuration failed: ${error}`);
+        return;
+      }
+    }
+
     setProcessing(true);
     try {
+      // Send strokes to backend first
+      for (const stroke of strokes) {
+        await invoke('add_stroke', { stroke });
+      }
+
       const result = await invoke('enhance_with_llm', {
         prompt: llmPrompt,
       });
@@ -112,7 +169,7 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
     } finally {
       setProcessing(false);
     }
-  }, [strokes, llmPrompt, setProcessing, onTogglePreview]);
+  }, [strokes, llmPrompt, llmBackend, llmApiKey, llmModelName, llmConfigured, setProcessing, onTogglePreview]);
 
   const handleExport = useCallback(async () => {
     if (strokes.length === 0) {
@@ -317,23 +374,33 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
       </div>
 
       {/* LLM */}
-      <div className="toolbar-group llm-group">
+      <div className="toolbar-group llm-group" style={{ position: 'relative' }}>
         <span className="toolbar-label">AI Format</span>
-        <input
-          type="text"
-          value={llmPrompt}
-          onChange={e => setLlmPrompt(e.target.value)}
-          placeholder="Enter formatting prompt..."
-          className="llm-input"
-        />
-        <button
-          className="toolbar-btn primary"
-          onClick={handleEnhanceWithLLM}
-          disabled={isProcessing}
-          title="Enhance with LLM"
-        >
-          🤖 Format
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            value={llmPrompt}
+            onChange={e => setLlmPrompt(e.target.value)}
+            placeholder="Enter formatting prompt..."
+            className="llm-input"
+          />
+          <button
+            className="toolbar-btn primary"
+            onClick={handleEnhanceWithLLM}
+            disabled={isProcessing}
+            title="Enhance with LLM"
+          >
+            🤖 Format
+          </button>
+          <button
+            ref={settingsBtnRef}
+            className={`toolbar-btn ${showLlmSettings ? 'active' : ''}`}
+            onClick={() => setShowLlmSettings(!showLlmSettings)}
+            title="LLM Settings"
+          >
+            ⚙️
+          </button>
+        </div>
       </div>
 
       {/* Export */}
@@ -359,6 +426,131 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
           {theme === 'light' ? '🌙' : '☀️'}
         </button>
       </div>
+
+      {/* LLM Settings Panel - rendered as fixed overlay to escape toolbar overflow clipping */}
+      {showLlmSettings && (() => {
+        const rect = settingsBtnRef.current?.getBoundingClientRect();
+        const top = rect ? rect.bottom + 4 : 60;
+        const right = rect ? window.innerWidth - rect.right : 16;
+        return (
+          <>
+            <div
+              style={{
+                position: 'fixed',
+                inset: 0,
+                zIndex: 9998,
+              }}
+              onClick={() => setShowLlmSettings(false)}
+            />
+            <div className="llm-settings" style={{
+              position: 'fixed',
+              top: `${top}px`,
+              right: `${right}px`,
+              zIndex: 9999,
+              background: 'var(--bg-primary, #fff)',
+              border: '1px solid var(--border-color, #ccc)',
+              borderRadius: '8px',
+              padding: '12px',
+              minWidth: '280px',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+              color: 'var(--text-primary, #333)',
+            }}>
+              <div style={{ marginBottom: '8px', fontWeight: 'bold' }}>LLM Settings</div>
+
+              <label style={{ display: 'block', marginBottom: '6px', fontSize: '12px' }}>
+                Backend
+                <select
+                  value={llmBackend}
+                  onChange={e => {
+                    setLlmBackend(e.target.value as LlmConfig['backend']);
+                    setLlmConfigured(false);
+                  }}
+                  style={{ display: 'block', width: '100%', padding: '4px', marginTop: '2px' }}
+                >
+                  <option value="builtin">Built-in (Rules)</option>
+                  <option value="openai">OpenAI (GPT-4o, etc.)</option>
+                  <option value="ollama">Ollama (Local)</option>
+                  <option value="local">Local GGUF Model</option>
+                  <option value="disabled">Disabled</option>
+                </select>
+              </label>
+
+              {llmBackend === 'openai' && (
+                <>
+                  <label style={{ display: 'block', marginBottom: '6px', fontSize: '12px' }}>
+                    API Key
+                    <input
+                      type="password"
+                      value={llmApiKey}
+                      onChange={e => {
+                        setLlmApiKey(e.target.value);
+                        setLlmConfigured(false);
+                      }}
+                      placeholder="sk-..."
+                      style={{ display: 'block', width: '100%', padding: '4px', marginTop: '2px' }}
+                    />
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '6px', fontSize: '12px' }}>
+                    Model
+                    <select
+                      value={llmModelName}
+                      onChange={e => {
+                        setLlmModelName(e.target.value);
+                        setLlmConfigured(false);
+                      }}
+                      style={{ display: 'block', width: '100%', padding: '4px', marginTop: '2px' }}
+                    >
+                      <option value="gpt-4o">GPT-4o</option>
+                      <option value="gpt-4-turbo">GPT-4 Turbo</option>
+                      <option value="gpt-4o-mini">GPT-4o Mini</option>
+                      <option value="gpt-3.5-turbo">GPT-3.5 Turbo</option>
+                    </select>
+                  </label>
+                </>
+              )}
+
+              {llmBackend === 'ollama' && (
+                <label style={{ display: 'block', marginBottom: '6px', fontSize: '12px' }}>
+                  Model Name
+                  <input
+                    type="text"
+                    value={llmModelName}
+                    onChange={e => {
+                      setLlmModelName(e.target.value);
+                      setLlmConfigured(false);
+                    }}
+                    placeholder="llama2, mistral, etc."
+                    style={{ display: 'block', width: '100%', padding: '4px', marginTop: '2px' }}
+                  />
+                </label>
+              )}
+
+              <div style={{ display: 'flex', gap: '6px', marginTop: '10px' }}>
+                <button
+                  className="toolbar-btn primary"
+                  onClick={handleConfigureLlm}
+                  style={{ flex: 1 }}
+                >
+                  ✅ Apply
+                </button>
+                <button
+                  className="toolbar-btn"
+                  onClick={() => setShowLlmSettings(false)}
+                  style={{ flex: 1 }}
+                >
+                  Cancel
+                </button>
+              </div>
+
+              {llmConfigured && (
+                <div style={{ marginTop: '6px', fontSize: '11px', color: 'green' }}>
+                  ✓ Configured: {llmBackend} / {llmModelName}
+                </div>
+              )}
+            </div>
+          </>
+        );
+      })()}
     </div>
   );
 }

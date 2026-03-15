@@ -8,8 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:dev": "tauri dev --features openai",
+    "tauri:build": "tauri build --features openai"
   },
   "dependencies": {
     "react": "^18.2.0",

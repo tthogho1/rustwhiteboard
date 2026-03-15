@@ -11,13 +11,14 @@ export interface ExportOptions {
 }
 
 export interface LlmConfig {
-  backend: 'builtin' | 'local' | 'ollama' | 'disabled';
+  backend: 'builtin' | 'local' | 'ollama' | 'openai' | 'disabled';
   model_path?: string;
   model_name: string;
   temperature: number;
   max_tokens: number;
   context_size: number;
   ollama_url?: string;
+  api_key?: string;
 }
 
 export interface AppInfo {
