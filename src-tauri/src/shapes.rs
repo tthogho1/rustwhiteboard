@@ -70,6 +70,7 @@ pub struct ArrowHead {
 pub struct DetectionParams {
     pub min_points: usize,
     pub circularity_threshold: f64,
+    pub ellipse_threshold: f64,
     pub rectangularity_threshold: f64,
     pub line_straightness_threshold: f64,
     pub arrow_angle_tolerance: f64,
@@ -80,6 +81,7 @@ impl Default for DetectionParams {
         Self {
             min_points: 5,
             circularity_threshold: 0.60,       // フリーハンド用にさらに緩和 (0.70 → 0.60)
+            ellipse_threshold: 0.50,           // 楕円検出の閾値
             rectangularity_threshold: 0.50,    // フリーハンド用にさらに緩和 (0.65 → 0.50)
             line_straightness_threshold: 0.75, // 直線検出を緩和 (0.80 → 0.75)
             arrow_angle_tolerance: 30.0,
@@ -188,7 +190,9 @@ fn detect_shape_from_stroke(stroke: &Stroke, params: &DetectionParams) -> Option
 
     // Count sharp corners to disambiguate circle vs square/rectangle.
     // A true circle has 0–1 sharp corners; a freehand square typically has 3–4.
-    let sharp_corners = count_sharp_corners(points, 45.0);
+    // Threshold raised to 70°: a circle simplified to ~5-6 segments has ~60° corners,
+    // while a rectangle has ~90° corners — 70° cleanly separates them.
+    let sharp_corners = count_sharp_corners(points, 70.0);
     let adjusted_circularity = if sharp_corners >= 3 {
         // Strong corner evidence → suppress circularity significantly
         circularity * (1.0 - (sharp_corners as f64 - 2.0) * 0.25).max(0.0)
@@ -198,10 +202,13 @@ fn detect_shape_from_stroke(stroke: &Stroke, params: &DetectionParams) -> Option
         circularity
     };
 
+    // Compute ellipticality (PCA-based axis fit)
+    let ellipticality = calculate_ellipticality(points, &center);
+
     println!("[SHAPE] Stroke {} raw→{} simplified, bounds: ({:.0}, {:.0}, {:.0}x{:.0})",
         raw_points.len(), points.len(), bounds.x, bounds.y, bounds.width, bounds.height);
-    println!("[SHAPE] Metrics: closed={}, circularity={:.2}, adjusted_circularity={:.2} (sharp_corners={}), rectangularity={:.2}, straightness={:.2}",
-        is_closed, circularity, adjusted_circularity, sharp_corners, rectangularity, straightness);
+    println!("[SHAPE] Metrics: closed={}, circularity={:.2}, adjusted_circularity={:.2} (sharp_corners={}), ellipticality={:.2}, rectangularity={:.2}, straightness={:.2}",
+        is_closed, circularity, adjusted_circularity, sharp_corners, ellipticality, rectangularity, straightness);
     println!("[SHAPE] Line check: !is_closed={}, straightness({:.2}) > threshold({:.2}) = {}",
         !is_closed, straightness, params.line_straightness_threshold,
         straightness > params.line_straightness_threshold);
@@ -219,6 +226,10 @@ fn detect_shape_from_stroke(stroke: &Stroke, params: &DetectionParams) -> Option
             println!("[SHAPE] → Detected as CIRCLE (high adjusted_circularity={:.2}, sharp_corners={})", adjusted_circularity, sharp_corners);
             // 円形度が高ければ円として判定（ダイヤモンドより優先）
             (ShapeType::Circle, adjusted_circularity)
+        } else if ellipticality > params.ellipse_threshold && is_closed && sharp_corners <= 1 {
+            println!("[SHAPE] → Detected as ELLIPSE (ellipticality={:.2})", ellipticality);
+            // 楕円: 円形度は低いが楕円フィットが高く、コーナーが少ない
+            (ShapeType::Ellipse, ellipticality)
         } else if rectangularity > params.rectangularity_threshold && is_closed {
             println!("[SHAPE] → Detected as RECTANGLE or DIAMOND (closed with high rectangularity)");
             // 閉じたストロークで矩形スコアが高い場合
@@ -380,6 +391,102 @@ fn calculate_circularity(points: &[Point], center: &(f64, f64)) -> f64 {
     
     // フリーハンド用に許容範囲を広げる（係数を2倍にして緩和）
     (1.0 - coefficient_of_variation * 2.0).max(0.0).min(1.0)
+}
+
+/// Calculate ellipticality score using PCA-based axis fitting.
+/// Returns 0..1 where higher means a strong ellipse fit with non-circular aspect ratio.
+fn calculate_ellipticality(points: &[Point], center: &(f64, f64)) -> f64 {
+    if points.len() < 5 {
+        return 0.0;
+    }
+
+    let cx = center.0;
+    let cy = center.1;
+
+    // Covariance matrix of centred points
+    let mut sxx = 0.0;
+    let mut sxy = 0.0;
+    let mut syy = 0.0;
+    for p in points {
+        let dx = p.x - cx;
+        let dy = p.y - cy;
+        sxx += dx * dx;
+        sxy += dx * dy;
+        syy += dy * dy;
+    }
+    let n = points.len() as f64;
+    sxx /= n;
+    sxy /= n;
+    syy /= n;
+
+    // Eigenvalues of the 2×2 covariance matrix
+    let trace = sxx + syy;
+    let det = sxx * syy - sxy * sxy;
+    let disc = (trace * trace / 4.0 - det).max(0.0).sqrt();
+    let lambda1 = trace / 2.0 + disc; // major
+    let lambda2 = trace / 2.0 - disc; // minor
+    if lambda1 <= 0.0 || lambda2 <= 0.0 {
+        return 0.0;
+    }
+
+    let major = lambda1.sqrt();
+    let minor = lambda2.sqrt();
+    if major == 0.0 {
+        return 0.0;
+    }
+
+    // Aspect ratio (0 = degenerate line, 1 = circle)
+    let aspect = (minor / major).clamp(0.0, 1.0);
+
+    // Eigenvector for the major axis
+    let (vx, vy) = if sxy.abs() < 1e-12 && sxx >= syy {
+        (1.0, 0.0)
+    } else if sxy.abs() < 1e-12 {
+        (0.0, 1.0)
+    } else {
+        let v_x = lambda1 - syy;
+        let v_y = sxy;
+        let norm = (v_x * v_x + v_y * v_y).sqrt().max(1e-12);
+        (v_x / norm, v_y / norm)
+    };
+    // Orthogonal minor-axis direction
+    let (ux, uy) = (-vy, vx);
+
+    // Fit score: project each point onto the PCA axes, normalise
+    // by the respective semi-axis length, then measure how close
+    // the normalised radius is to 1.0 (perfect ellipse).
+    let mut sum_r = 0.0;
+    let mut sum_r2 = 0.0;
+    for p in points {
+        let dx = p.x - cx;
+        let dy = p.y - cy;
+        let proj_major = dx * vx + dy * vy;
+        let proj_minor = dx * ux + dy * uy;
+        let r = ((proj_major / major.max(1e-6)).powi(2)
+               + (proj_minor / minor.max(1e-6)).powi(2))
+            .sqrt();
+        sum_r += r;
+        sum_r2 += r * r;
+    }
+    let mean_r = sum_r / n;
+    let var_r = (sum_r2 / n) - mean_r * mean_r;
+    let std_r = var_r.max(0.0).sqrt();
+
+    // fit_score: tight ellipse ⇒ low std_r ⇒ high score
+    let fit_score = (1.0 - std_r).clamp(0.0, 1.0);
+
+    // Penalise near-circular shapes (those should stay Circle).
+    // aspect close to 1 → near-circle → low eccentricity bonus
+    let eccentricity_bonus = if aspect > 0.85 {
+        // Very round – prefer Circle classification
+        0.0
+    } else if aspect > 0.70 {
+        0.5
+    } else {
+        1.0
+    };
+
+    (fit_score * (0.5 + 0.5 * eccentricity_bonus)).clamp(0.0, 1.0)
 }
 
 /// Calculate average radius from center
