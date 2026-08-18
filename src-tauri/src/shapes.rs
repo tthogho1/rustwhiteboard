@@ -768,15 +768,256 @@ fn point_to_line_distance(point: &Point, line_start: &Point, line_end: &Point) -
     ((point.x - proj_x).powi(2) + (point.y - proj_y).powi(2)).sqrt()
 }
 
-/// Detect compound shapes (connected shapes)
-fn detect_compound_shapes(shapes: &[DetectedShape], _strokes: &[Stroke]) -> Vec<DetectedShape> {
-    // For now, return empty - can be extended to detect connected flowchart elements
-    Vec::new()
+/// One open stroke that may be a piece of a larger, multi-stroke figure.
+struct ChainCandidate<'a> {
+    shape: &'a DetectedShape,
+    points: &'a [Point],
 }
 
-/// Merge individual and compound shapes
+impl<'a> ChainCandidate<'a> {
+    /// First point of the stroke, or the last one when walked in reverse.
+    fn head(&self, reversed: bool) -> (f64, f64) {
+        let p = if reversed { self.points.last() } else { self.points.first() };
+        let p = p.expect("candidates always have at least two points");
+        (p.x, p.y)
+    }
+
+    /// The endpoint the chain continues from after consuming this stroke.
+    fn tail(&self, reversed: bool) -> (f64, f64) {
+        let p = if reversed { self.points.first() } else { self.points.last() };
+        let p = p.expect("candidates always have at least two points");
+        (p.x, p.y)
+    }
+
+    /// Straight-line distance between the endpoints, used to size tolerances.
+    fn span(&self) -> f64 {
+        let a = self.head(false);
+        let b = self.tail(false);
+        distance(a, b)
+    }
+}
+
+fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+}
+
+/// How far apart two endpoints may be and still count as the same corner.
+/// Scaled to the shorter of the two strokes so that small figures are not
+/// glued together by a tolerance meant for large ones.
+fn junction_tolerance(span_a: f64, span_b: f64) -> f64 {
+    (0.25 * span_a.min(span_b)).clamp(8.0, 40.0)
+}
+
+/// Detect figures drawn with several separate strokes.
+///
+/// A rectangle drawn as four flicks of the pen reaches this point as four
+/// `Line` shapes, and would otherwise be exported as four loose connectors.
+/// Strokes whose endpoints chain back to where the chain started are merged
+/// into a single closed shape. Arrows are never candidates: they are drawn as
+/// connectors on purpose.
+fn detect_compound_shapes(shapes: &[DetectedShape], strokes: &[Stroke]) -> Vec<DetectedShape> {
+    let params = DetectionParams::default();
+    let stroke_map: std::collections::HashMap<&str, &Stroke> =
+        strokes.iter().map(|s| (s.id.as_str(), s)).collect();
+
+    let candidates: Vec<ChainCandidate> = shapes
+        .iter()
+        .filter(|s| matches!(s.shape_type, ShapeType::Line | ShapeType::Connector))
+        .filter_map(|shape| {
+            let stroke = stroke_map.get(shape.stroke_ids.first()?.as_str())?;
+            if stroke.points.len() < 2 {
+                return None;
+            }
+            Some(ChainCandidate { shape, points: &stroke.points })
+        })
+        .collect();
+
+    if candidates.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut used = vec![false; candidates.len()];
+    let mut compound = Vec::new();
+
+    for start in 0..candidates.len() {
+        if used[start] {
+            continue;
+        }
+        let Some(chain) = build_closed_chain(&candidates, &used, start) else {
+            continue;
+        };
+        let Some(shape) = shape_from_chain(&candidates, &chain, &params) else {
+            continue;
+        };
+        for &(idx, _) in &chain {
+            used[idx] = true;
+        }
+        println!(
+            "[SHAPE] Compound {:?} from {} strokes (confidence {:.2})",
+            shape.shape_type, chain.len(), shape.confidence
+        );
+        compound.push(shape);
+    }
+
+    compound
+}
+
+/// Walk from `start` along touching endpoints until the chain closes on itself.
+///
+/// Returns the members in traversal order with a flag saying whether the stroke
+/// has to be walked backwards, or `None` when the strokes form an open path.
+fn build_closed_chain(
+    candidates: &[ChainCandidate],
+    used: &[bool],
+    start: usize,
+) -> Option<Vec<(usize, bool)>> {
+    // A chain longer than this is noise rather than a hand-drawn outline.
+    const MAX_CHAIN: usize = 12;
+
+    let start_point = candidates[start].head(false);
+    let mut chain = vec![(start, false)];
+    let mut in_chain = vec![false; candidates.len()];
+    in_chain[start] = true;
+    let mut current = candidates[start].tail(false);
+
+    loop {
+        if chain.len() >= 2 {
+            let closing = junction_tolerance(
+                candidates[start].span(),
+                candidates[chain.last()?.0].span(),
+            );
+            if distance(current, start_point) <= closing {
+                return Some(chain);
+            }
+        }
+        if chain.len() >= MAX_CHAIN {
+            return None;
+        }
+
+        // Nearest unused stroke whose endpoint meets the one we stopped at.
+        let mut best: Option<(usize, bool, f64)> = None;
+        for (j, candidate) in candidates.iter().enumerate() {
+            if used[j] || in_chain[j] {
+                continue;
+            }
+            let tolerance = junction_tolerance(candidates[chain.last()?.0].span(), candidate.span());
+            for reversed in [false, true] {
+                let d = distance(current, candidate.head(reversed));
+                if d <= tolerance && best.map_or(true, |(_, _, best_d)| d < best_d) {
+                    best = Some((j, reversed, d));
+                }
+            }
+        }
+
+        let (next, reversed, _) = best?;
+        in_chain[next] = true;
+        chain.push((next, reversed));
+        current = candidates[next].tail(reversed);
+    }
+}
+
+/// Turn a closed chain of strokes into a single shape.
+fn shape_from_chain(
+    candidates: &[ChainCandidate],
+    chain: &[(usize, bool)],
+    params: &DetectionParams,
+) -> Option<DetectedShape> {
+    let mut points: Vec<Point> = Vec::new();
+    for &(idx, reversed) in chain {
+        let member = &candidates[idx];
+        if reversed {
+            points.extend(member.points.iter().rev().cloned());
+        } else {
+            points.extend(member.points.iter().cloned());
+        }
+    }
+    if points.len() < 5 {
+        return None;
+    }
+
+    let bounds = calculate_bounds(&points);
+    if bounds.width < 15.0 || bounds.height < 15.0 {
+        return None;
+    }
+    let center = calculate_centroid(&points);
+
+    // Unlike a single stroke, the members here are separate open strokes, so a
+    // polygon is by far the likeliest reading: the number of straight members
+    // decides the shape, and the metric scores only arbitrate the rest.
+    let all_straight = chain
+        .iter()
+        .all(|&(idx, _)| candidates[idx].shape.shape_type == ShapeType::Line);
+    let member_confidence: f64 = chain
+        .iter()
+        .map(|&(idx, _)| candidates[idx].shape.confidence)
+        .sum::<f64>()
+        / chain.len() as f64;
+
+    let circularity = calculate_circularity(&points, &center);
+    let (shape_type, confidence) = match (chain.len(), all_straight) {
+        (3, true) => (ShapeType::Triangle, member_confidence * 0.95),
+        (4, true) => {
+            if circularity < 0.5 && check_diamond(&points, &center) {
+                (ShapeType::Diamond, member_confidence * 0.9)
+            } else {
+                (ShapeType::Rectangle, member_confidence * 0.95)
+            }
+        }
+        _ => {
+            let rectangularity = calculate_rectangularity(&points, &bounds);
+            let triangle_score = calculate_triangle_score(&points);
+            if rectangularity > params.rectangularity_threshold {
+                (ShapeType::Rectangle, rectangularity)
+            } else if triangle_score > 0.75 {
+                (ShapeType::Triangle, triangle_score)
+            } else if circularity > params.circularity_threshold {
+                (ShapeType::Circle, circularity)
+            } else {
+                (ShapeType::Freeform, 0.5)
+            }
+        }
+    };
+
+    let properties = ShapeProperties {
+        center_x: center.0,
+        center_y: center.1,
+        radius: if shape_type == ShapeType::Circle {
+            Some(calculate_average_radius(&points, &center))
+        } else {
+            None
+        },
+        // A closed figure has no meaningful start/end for connector routing.
+        start_point: None,
+        end_point: None,
+        corner_radius: None,
+        arrow_head: None,
+    };
+
+    Some(DetectedShape {
+        id: uuid::Uuid::new_v4().to_string(),
+        shape_type,
+        bounds,
+        confidence: confidence.clamp(0.0, 1.0),
+        stroke_ids: chain
+            .iter()
+            .flat_map(|&(idx, _)| candidates[idx].shape.stroke_ids.clone())
+            .collect(),
+        properties,
+    })
+}
+
+/// Merge individual and compound shapes, dropping the individual strokes that
+/// were absorbed into a compound one.
 fn merge_shapes(individual: Vec<DetectedShape>, compound: Vec<DetectedShape>) -> Vec<DetectedShape> {
-    let mut result = individual;
+    let consumed: std::collections::HashSet<String> = compound
+        .iter()
+        .flat_map(|shape| shape.stroke_ids.iter().cloned())
+        .collect();
+
+    let mut result: Vec<DetectedShape> = individual
+        .into_iter()
+        .filter(|shape| !shape.stroke_ids.iter().any(|id| consumed.contains(id)))
+        .collect();
     result.extend(compound);
     result
 }
@@ -897,6 +1138,104 @@ mod tests {
         ];
         
         assert!(!is_stroke_closed(&open_points, 10.0));
+    }
+
+    /// A straight pen stroke from `from` to `to`, dense enough to be detected.
+    fn line_stroke(id: &str, from: (f64, f64), to: (f64, f64)) -> Stroke {
+        let steps = 20;
+        let points = (0..=steps)
+            .map(|i| {
+                let t = i as f64 / steps as f64;
+                Point {
+                    x: from.0 + (to.0 - from.0) * t,
+                    y: from.1 + (to.1 - from.1) * t,
+                    pressure: None,
+                    timestamp: i as u64,
+                }
+            })
+            .collect();
+
+        Stroke {
+            id: id.to_string(),
+            points,
+            color: "#000000".to_string(),
+            width: 2.0,
+            tool: "pen".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_rectangle_from_four_strokes() {
+        let strokes = vec![
+            line_stroke("top", (0.0, 0.0), (200.0, 0.0)),
+            line_stroke("right", (200.0, 0.0), (200.0, 150.0)),
+            line_stroke("bottom", (200.0, 150.0), (0.0, 150.0)),
+            line_stroke("left", (0.0, 150.0), (0.0, 0.0)),
+        ];
+
+        let shapes = detect_shapes(&strokes);
+
+        assert_eq!(shapes.len(), 1, "the four sides should merge into one shape");
+        assert_eq!(shapes[0].shape_type, ShapeType::Rectangle);
+        assert_eq!(shapes[0].stroke_ids.len(), 4);
+        assert_eq!(shapes[0].bounds.width, 200.0);
+        assert_eq!(shapes[0].bounds.height, 150.0);
+    }
+
+    #[test]
+    fn test_rectangle_from_strokes_drawn_in_any_direction() {
+        // Sides drawn away from a shared corner, so two of them need reversing.
+        let strokes = vec![
+            line_stroke("top", (0.0, 0.0), (200.0, 0.0)),
+            line_stroke("left", (0.0, 0.0), (0.0, 150.0)),
+            line_stroke("bottom", (0.0, 150.0), (200.0, 150.0)),
+            line_stroke("right", (200.0, 0.0), (200.0, 150.0)),
+        ];
+
+        let shapes = detect_shapes(&strokes);
+
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(shapes[0].shape_type, ShapeType::Rectangle);
+    }
+
+    #[test]
+    fn test_triangle_from_three_strokes() {
+        let strokes = vec![
+            line_stroke("a", (100.0, 0.0), (200.0, 160.0)),
+            line_stroke("b", (200.0, 160.0), (0.0, 160.0)),
+            line_stroke("c", (0.0, 160.0), (100.0, 0.0)),
+        ];
+
+        let shapes = detect_shapes(&strokes);
+
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(shapes[0].shape_type, ShapeType::Triangle);
+    }
+
+    #[test]
+    fn test_open_corner_is_not_merged() {
+        // Two sides of a box: a chain that never closes stays two lines.
+        let strokes = vec![
+            line_stroke("top", (0.0, 0.0), (200.0, 0.0)),
+            line_stroke("right", (200.0, 0.0), (200.0, 150.0)),
+        ];
+
+        let shapes = detect_shapes(&strokes);
+
+        assert_eq!(shapes.len(), 2);
+        assert!(shapes.iter().all(|s| s.shape_type == ShapeType::Line));
+    }
+
+    #[test]
+    fn test_distant_lines_are_not_merged() {
+        let strokes = vec![
+            line_stroke("a", (0.0, 0.0), (200.0, 0.0)),
+            line_stroke("b", (0.0, 300.0), (200.0, 300.0)),
+        ];
+
+        let shapes = detect_shapes(&strokes);
+
+        assert_eq!(shapes.len(), 2);
     }
 
     #[test]

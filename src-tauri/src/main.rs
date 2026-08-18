@@ -93,6 +93,22 @@ async fn add_stroke(
     Ok(())
 }
 
+/// Replace the backend stroke list with the frontend's current canvas.
+///
+/// The frontend store is the source of truth for what is on the canvas, so
+/// replacing wholesale keeps repeated analysis runs idempotent. Pushing the
+/// same strokes again with `add_stroke` would append duplicates.
+#[tauri::command]
+async fn sync_strokes(
+    state: State<'_, AppState>,
+    strokes: Vec<Stroke>,
+) -> Result<usize, String> {
+    let mut current = state.strokes.lock().map_err(|e| e.to_string())?;
+    println!("[STROKE] sync_strokes: {} -> {} strokes", current.len(), strokes.len());
+    *current = strokes;
+    Ok(current.len())
+}
+
 /// Clear all strokes from the canvas
 #[tauri::command]
 async fn clear_strokes(state: State<'_, AppState>) -> Result<(), String> {
@@ -195,6 +211,30 @@ async fn enhance_with_llm(
     });
 
     llm::enhance_diagram(&shapes, &text_regions, &custom_prompt, &config).await
+}
+
+/// Overwrite the text of already-detected OCR regions, keyed by region id.
+///
+/// This is how corrections made in the preview reach the export: shape labels
+/// in the generated XML come from `AppState.ocr_text`, so unedited regions keep
+/// whatever OCR produced (`"[Handwritten text]"` when the `ocr` feature is off).
+#[tauri::command]
+async fn update_text_labels(
+    state: State<'_, AppState>,
+    labels: std::collections::HashMap<String, String>,
+) -> Result<Vec<ocr::TextRegion>, String> {
+    let mut regions = state.ocr_text.lock().map_err(|e| e.to_string())?;
+
+    let mut updated = 0;
+    for region in regions.iter_mut() {
+        if let Some(text) = labels.get(&region.id) {
+            region.text = text.clone();
+            updated += 1;
+        }
+    }
+    println!("[OCR] update_text_labels: {}/{} regions updated", updated, regions.len());
+
+    Ok(regions.clone())
 }
 
 /// Generate draw.io XML from the processed diagram
@@ -329,10 +369,12 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             add_stroke,
+            sync_strokes,
             clear_strokes,
             get_strokes,
             process_canvas,
             enhance_with_llm,
+            update_text_labels,
             generate_drawio,
             export_drawio_file,
             configure_llm,

@@ -71,6 +71,9 @@ interface StoreState {
   // Processing state
   isProcessing: boolean;
   processingResult: ProcessingResult | null;
+  /** True when the strokes changed after the last analysis, so the detected
+   *  shapes / text held by the backend no longer describe the canvas. */
+  isAnalysisStale: boolean;
 
   // UI state
   theme: Theme;
@@ -107,6 +110,7 @@ interface StoreState {
   // Processing actions
   setProcessing: (processing: boolean) => void;
   setProcessingResult: (result: ProcessingResult | null) => void;
+  setAnalysisStale: (stale: boolean) => void;
 }
 
 const generateId = () => Math.random().toString(36).substring(2, 15);
@@ -126,6 +130,7 @@ export const useStore = create<StoreState>()(
       panY: 0,
       isProcessing: false,
       processingResult: null,
+      isAnalysisStale: true,
       theme: 'light',
       showGrid: true,
       history: [[]],
@@ -179,11 +184,13 @@ export const useStore = create<StoreState>()(
             set({
               strokes: remainingStrokes,
               currentStroke: null,
+              isAnalysisStale: true,
             });
           } else {
             set({
               strokes: [...strokes, currentStroke],
               currentStroke: null,
+              isAnalysisStale: true,
             });
           }
           get().saveHistory();
@@ -195,6 +202,7 @@ export const useStore = create<StoreState>()(
       addStroke: stroke => {
         set(state => ({
           strokes: [...state.strokes, stroke],
+          isAnalysisStale: true,
         }));
         get().saveHistory();
       },
@@ -202,17 +210,18 @@ export const useStore = create<StoreState>()(
       removeStroke: id => {
         set(state => ({
           strokes: state.strokes.filter(s => s.id !== id),
+          isAnalysisStale: true,
         }));
         get().saveHistory();
       },
 
       clearStrokes: () => {
-        set({ strokes: [], processingResult: null });
+        set({ strokes: [], processingResult: null, isAnalysisStale: true });
         get().saveHistory();
       },
 
       setStrokes: strokes => {
-        set({ strokes });
+        set({ strokes, processingResult: null, isAnalysisStale: true });
         get().saveHistory();
       },
 
@@ -234,6 +243,7 @@ export const useStore = create<StoreState>()(
           set({
             strokes: [...history[newIndex]],
             historyIndex: newIndex,
+            isAnalysisStale: true,
           });
         }
       },
@@ -245,6 +255,7 @@ export const useStore = create<StoreState>()(
           set({
             strokes: [...history[newIndex]],
             historyIndex: newIndex,
+            isAnalysisStale: true,
           });
         }
       },
@@ -252,6 +263,7 @@ export const useStore = create<StoreState>()(
       // Processing actions
       setProcessing: processing => set({ isProcessing: processing }),
       setProcessingResult: result => set({ processingResult: result }),
+      setAnalysisStale: stale => set({ isAnalysisStale: stale }),
     }),
     {
       name: 'rustwhiteboard-storage',

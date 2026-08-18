@@ -3,6 +3,7 @@ import { useStore, Tool } from '../store';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { api } from '../lib/api';
+import { ensureAnalyzed } from '../lib/pipeline';
 import type { LlmConfig } from '../lib/api';
 
 interface ToolbarProps {
@@ -26,13 +27,13 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
     setShowGrid,
     strokes,
     clearStrokes,
+    setStrokes,
     undo,
     redo,
     history,
     historyIndex,
     isProcessing,
     setProcessing,
-    setProcessingResult,
   } = useStore();
 
   const [llmPrompt, setLlmPrompt] = useState(
@@ -73,25 +74,7 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
 
     setProcessing(true);
     try {
-      // Get canvas image data
-      const canvas = document.querySelector('.drawing-canvas') as HTMLCanvasElement;
-      if (!canvas) throw new Error('Canvas not found');
-
-      const imageData = canvas.toDataURL('image/png');
-
-      // Send strokes to backend
-      for (const stroke of strokes) {
-        await invoke('add_stroke', { stroke });
-      }
-
-      // Process canvas
-      const result = await invoke('process_canvas', {
-        imageData,
-        width: canvas.width,
-        height: canvas.height,
-      });
-
-      setProcessingResult(result as any);
+      await ensureAnalyzed({ force: true });
       onTogglePreview();
     } catch (error) {
       console.error('Processing failed:', error);
@@ -99,7 +82,7 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
     } finally {
       setProcessing(false);
     }
-  }, [strokes, setProcessing, setProcessingResult, onTogglePreview]);
+  }, [strokes, setProcessing, onTogglePreview]);
 
   const handleConfigureLlm = useCallback(async () => {
     try {
@@ -151,17 +134,19 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
 
     setProcessing(true);
     try {
-      // Send strokes to backend first
-      for (const stroke of strokes) {
-        await invoke('add_stroke', { stroke });
-      }
+      // The backend enhances the *detected* shapes, so detection has to have run.
+      await ensureAnalyzed();
 
-      const result = await invoke('enhance_with_llm', {
-        prompt: llmPrompt,
-      });
-      console.log('LLM Enhancement result:', result);
-      setProcessingResult(result as any);
-      alert('LLM processing completed! Check the preview.');
+      const structure = await invoke<{ nodes?: unknown[]; edges?: unknown[] }>(
+        'enhance_with_llm',
+        { prompt: llmPrompt }
+      );
+      console.log('LLM Enhancement result:', structure);
+      alert(
+        `AI formatting done: ${structure.nodes?.length ?? 0} nodes, ` +
+          `${structure.edges?.length ?? 0} edges (see the console).\n` +
+          'Note: the .drawio export still uses the detected shapes.'
+      );
       onTogglePreview();
     } catch (error) {
       console.error('LLM processing failed:', error);
@@ -190,19 +175,9 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
 
       if (!filePath) return;
 
-      // Ensure backend has the strokes and detected shapes before exporting
-      const canvas = document.querySelector('.drawing-canvas') as HTMLCanvasElement;
-      if (canvas) {
-        const imageData = canvas.toDataURL('image/png');
-        for (const stroke of strokes) {
-          await invoke('add_stroke', { stroke });
-        }
-        await invoke('process_canvas', {
-          imageData,
-          width: canvas.width,
-          height: canvas.height,
-        });
-      }
+      // Ensure the backend holds shapes matching the canvas. Already-analyzed
+      // canvases are not re-detected, so label corrections survive the export.
+      await ensureAnalyzed();
 
       await invoke('export_drawio_file', {
         path: filePath,
@@ -221,6 +196,16 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
       alert(`Export failed: ${error}`);
     }
   }, [strokes, theme]);
+
+  const handleClear = useCallback(async () => {
+    clearStrokes();
+    try {
+      await api.clearStrokes();
+    } catch (error) {
+      // The canvas is already cleared; a stale backend only matters on re-analysis.
+      console.error('Failed to clear backend state:', error);
+    }
+  }, [clearStrokes]);
 
   const handleSaveBackup = useCallback(async () => {
     try {
@@ -243,6 +228,30 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
       alert(`Backup failed: ${error}`);
     }
   }, []);
+
+  const handleLoadBackup = useCallback(async () => {
+    try {
+      const filePath = await api.openFile([
+        { name: 'Whiteboard Backup', extensions: ['gz', 'rwb'] },
+      ]);
+      if (!filePath) return;
+
+      if (strokes.length > 0) {
+        const proceed = await api.confirm(
+          'Restore Backup',
+          'This replaces everything currently on the canvas. Continue?'
+        );
+        if (!proceed) return;
+      }
+
+      const restored = await api.loadBackup(filePath);
+      setStrokes(restored);
+      alert(`Restored ${restored.length} strokes.`);
+    } catch (error) {
+      console.error('Restore failed:', error);
+      alert(`Restore failed: ${error}`);
+    }
+  }, [strokes, setStrokes]);
 
   const handleResetView = useCallback(() => {
     setZoom(1);
@@ -349,7 +358,7 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
           >
             ↪️
           </button>
-          <button className="toolbar-btn danger" onClick={clearStrokes} title="Clear All">
+          <button className="toolbar-btn danger" onClick={handleClear} title="Clear All">
             🗑️
           </button>
         </div>
@@ -412,6 +421,9 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
           </button>
           <button className="toolbar-btn" onClick={handleSaveBackup} title="Save Backup">
             💾 Backup
+          </button>
+          <button className="toolbar-btn" onClick={handleLoadBackup} title="Restore Backup">
+            📂 Restore
           </button>
         </div>
       </div>

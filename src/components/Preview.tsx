@@ -2,19 +2,44 @@ import { useStore } from '../store';
 import { useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
+import { api } from '../lib/api';
+import { ensureAnalyzed } from '../lib/pipeline';
 
 interface PreviewProps {
   onClose: () => void;
 }
 
 export function Preview({ onClose }: PreviewProps) {
-  const { processingResult, theme } = useStore();
+  const { processingResult, theme, setProcessingResult } = useStore();
   const [activeTab, setActiveTab] = useState<'shapes' | 'text' | 'xml'>('shapes');
   const [xmlPreview, setXmlPreview] = useState<string>('');
   const [editedLabels, setEditedLabels] = useState<Record<string, string>>({});
 
+  /**
+   * Send edited labels to the backend, which is where `generate_drawio` reads
+   * them from. Without this the edits would stay in this component only.
+   */
+  const commitLabels = useCallback(async () => {
+    if (Object.keys(editedLabels).length === 0) return;
+
+    try {
+      const regions = await api.updateTextLabels(editedLabels);
+      if (processingResult) {
+        setProcessingResult({ ...processingResult, text_regions: regions });
+      }
+      setEditedLabels({});
+    } catch (error) {
+      console.error('Failed to save label edits:', error);
+      alert(`Failed to save label edits: ${error}`);
+      throw error;
+    }
+  }, [editedLabels, processingResult, setProcessingResult]);
+
   const handleGenerateXml = useCallback(async () => {
     try {
+      await commitLabels();
+      await ensureAnalyzed();
+
       const xml = await invoke<string>('generate_drawio', {
         options: {
           filename: 'preview',
@@ -30,11 +55,14 @@ export function Preview({ onClose }: PreviewProps) {
       console.error('XML generation failed:', error);
       alert(`Failed to generate XML: ${error}`);
     }
-  }, [theme]);
+  }, [theme, commitLabels]);
 
   const handleExport = useCallback(async () => {
     console.log('🔹 handleExport called');
     try {
+      await commitLabels();
+      await ensureAnalyzed();
+
       console.log('🔹 Opening save dialog...');
       const filePath = await save({
         filters: [{ name: 'Draw.io', extensions: ['drawio'] }],
@@ -65,7 +93,7 @@ export function Preview({ onClose }: PreviewProps) {
       console.error('❌ Export failed:', error);
       alert(`Export failed: ${error}`);
     }
-  }, [theme]);
+  }, [theme, commitLabels]);
 
   const handleLabelEdit = (id: string, value: string) => {
     setEditedLabels(prev => ({ ...prev, [id]: value }));
@@ -168,6 +196,10 @@ export function Preview({ onClose }: PreviewProps) {
                     type="text"
                     value={editedLabels[region.id] ?? region.text}
                     onChange={e => handleLabelEdit(region.id, e.target.value)}
+                    onBlur={() => {
+                      // Errors are already reported inside commitLabels().
+                      commitLabels().catch(() => {});
+                    }}
                     className="text-edit"
                     placeholder="Edit text..."
                   />
