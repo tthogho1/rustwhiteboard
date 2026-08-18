@@ -1,6 +1,6 @@
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { open, save, message as showDialog, ask } from '@tauri-apps/plugin-dialog';
-import type { Stroke, ProcessingResult } from '../store';
+import type { Stroke, ProcessingResult, TextRegion } from '../store';
 
 export interface ExportOptions {
   filename: string;
@@ -45,6 +45,14 @@ export const api = {
     return safeInvoke('add_stroke', { stroke });
   },
 
+  /**
+   * Replace the backend stroke list with the canvas contents.
+   * Prefer this over looping `addStroke`, which appends duplicates.
+   */
+  async syncStrokes(strokes: Stroke[]): Promise<number> {
+    return safeInvoke('sync_strokes', { strokes });
+  },
+
   async clearStrokes(): Promise<void> {
     return safeInvoke('clear_strokes');
   },
@@ -56,6 +64,11 @@ export const api = {
   // Processing
   async processCanvas(imageData: string, width: number, height: number): Promise<ProcessingResult> {
     return safeInvoke('process_canvas', { imageData, width, height });
+  },
+
+  /** Correct the text of detected OCR regions, keyed by region id. */
+  async updateTextLabels(labels: Record<string, string>): Promise<TextRegion[]> {
+    return safeInvoke('update_text_labels', { labels });
   },
 
   // LLM
