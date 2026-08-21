@@ -1,17 +1,25 @@
-import { useStore } from '../store';
+import { SHAPE_TYPES, useStore, type ShapeType } from '../store';
 import { useCallback, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { save } from '@tauri-apps/plugin-dialog';
 import { api } from '../lib/api';
 import { ensureAnalyzed } from '../lib/pipeline';
+import { exportDrawio } from '../lib/actions';
+import { measureText } from '../lib/text';
 
 interface PreviewProps {
   onClose: () => void;
 }
 
 export function Preview({ onClose }: PreviewProps) {
-  const { processingResult, theme, setProcessingResult } = useStore();
-  const [activeTab, setActiveTab] = useState<'shapes' | 'text' | 'xml'>('shapes');
+  const {
+    processingResult,
+    theme,
+    setProcessingResult,
+    textAnnotations,
+    updateTextAnnotation,
+    removeTextAnnotation,
+    saveHistory,
+  } = useStore();
+  const [activeTab, setActiveTab] = useState<'shapes' | 'text' | 'notes' | 'xml'>('shapes');
   const [xmlPreview, setXmlPreview] = useState<string>('');
   const [editedLabels, setEditedLabels] = useState<Record<string, string>>({});
 
@@ -35,19 +43,44 @@ export function Preview({ onClose }: PreviewProps) {
     }
   }, [editedLabels, processingResult, setProcessingResult]);
 
+  /**
+   * Override a misdetected classification. The backend owns the shape list, so
+   * take its response as the new truth rather than patching locally.
+   */
+  const handleShapeTypeChange = useCallback(
+    async (shapeId: string, shapeType: ShapeType) => {
+      try {
+        const shapes = await api.updateShapeType(shapeId, shapeType);
+        if (processingResult) {
+          setProcessingResult({ ...processingResult, shapes });
+        }
+      } catch (error) {
+        console.error('Failed to change shape type:', error);
+        alert(`Failed to change shape type: ${error}`);
+      }
+    },
+    [processingResult, setProcessingResult]
+  );
+
+  const handleAnnotationEdit = useCallback(
+    (id: string, text: string, fontSize: number) => {
+      const { width, height } = measureText(text, fontSize);
+      updateTextAnnotation(id, { text, width, height });
+    },
+    [updateTextAnnotation]
+  );
+
   const handleGenerateXml = useCallback(async () => {
     try {
       await commitLabels();
       await ensureAnalyzed();
 
-      const xml = await invoke<string>('generate_drawio', {
-        options: {
-          filename: 'preview',
-          include_grid: true,
-          page_width: 1920,
-          page_height: 1080,
-          theme: theme,
-        },
+      const xml = await api.generateDrawio({
+        filename: 'preview',
+        include_grid: true,
+        page_width: 1920,
+        page_height: 1080,
+        theme,
       });
       setXmlPreview(xml);
       setActiveTab('xml');
@@ -58,42 +91,14 @@ export function Preview({ onClose }: PreviewProps) {
   }, [theme, commitLabels]);
 
   const handleExport = useCallback(async () => {
-    console.log('🔹 handleExport called');
     try {
       await commitLabels();
-      await ensureAnalyzed();
-
-      console.log('🔹 Opening save dialog...');
-      const filePath = await save({
-        filters: [{ name: 'Draw.io', extensions: ['drawio'] }],
-        defaultPath: 'diagram.drawio',
-      });
-
-      console.log('🔹 save() returned:', filePath);
-      if (!filePath) {
-        console.log('❌ Save cancelled or no path returned');
-        return;
-      }
-
-      console.log('🔹 Invoking export_drawio_file with path:', filePath);
-      await invoke('export_drawio_file', {
-        path: filePath,
-        options: {
-          filename: 'diagram',
-          include_grid: true,
-          page_width: 1920,
-          page_height: 1080,
-          theme: theme,
-        },
-      });
-
-      console.log('✅ Export successful!');
-      alert(`Exported to ${filePath}`);
-    } catch (error) {
-      console.error('❌ Export failed:', error);
-      alert(`Export failed: ${error}`);
+    } catch {
+      // commitLabels already reported the failure; don't export stale labels.
+      return;
     }
-  }, [theme, commitLabels]);
+    await exportDrawio();
+  }, [commitLabels]);
 
   const handleLabelEdit = (id: string, value: string) => {
     setEditedLabels(prev => ({ ...prev, [id]: value }));
@@ -134,6 +139,12 @@ export function Preview({ onClose }: PreviewProps) {
             Text ({processingResult.text_regions.length})
           </button>
           <button
+            className={`tab-btn ${activeTab === 'notes' ? 'active' : ''}`}
+            onClick={() => setActiveTab('notes')}
+          >
+            Notes ({textAnnotations.length})
+          </button>
+          <button
             className={`tab-btn ${activeTab === 'xml' ? 'active' : ''}`}
             onClick={() => setActiveTab('xml')}
           >
@@ -164,7 +175,20 @@ export function Preview({ onClose }: PreviewProps) {
                 <div key={shape.id} className="shape-item">
                   <div className="shape-header">
                     <span className="shape-index">#{index + 1}</span>
-                    <span className="shape-type">{shape.shape_type}</span>
+                    <select
+                      className="shape-type-select"
+                      value={shape.shape_type}
+                      onChange={e =>
+                        handleShapeTypeChange(shape.id, e.target.value as ShapeType)
+                      }
+                      title="Correct the detected type"
+                    >
+                      {SHAPE_TYPES.map(type => (
+                        <option key={type} value={type}>
+                          {type}
+                        </option>
+                      ))}
+                    </select>
                     <span className="shape-confidence">{Math.round(shape.confidence * 100)}%</span>
                   </div>
                   <div className="shape-details">
@@ -206,6 +230,49 @@ export function Preview({ onClose }: PreviewProps) {
                   <div className="text-details">
                     <span>
                       Position: ({Math.round(region.bounds.x)}, {Math.round(region.bounds.y)})
+                    </span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {activeTab === 'notes' && (
+          <div className="text-list">
+            {textAnnotations.length === 0 ? (
+              <p className="empty-message">
+                No typed text. Pick the Text tool (T) and click the canvas.
+              </p>
+            ) : (
+              textAnnotations.map((annotation, index) => (
+                <div key={annotation.id} className="text-item">
+                  <div className="text-header">
+                    <span className="text-index">#{index + 1}</span>
+                    <button
+                      className="text-delete"
+                      onClick={() => {
+                        removeTextAnnotation(annotation.id);
+                        saveHistory();
+                      }}
+                      title="Delete this text"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <input
+                    type="text"
+                    value={annotation.text}
+                    onChange={e =>
+                      handleAnnotationEdit(annotation.id, e.target.value, annotation.fontSize)
+                    }
+                    onBlur={saveHistory}
+                    className="text-edit"
+                    placeholder="Edit text..."
+                  />
+                  <div className="text-details">
+                    <span>
+                      Position: ({Math.round(annotation.x)}, {Math.round(annotation.y)})
                     </span>
                   </div>
                 </div>

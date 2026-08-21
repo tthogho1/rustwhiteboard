@@ -1,6 +1,20 @@
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { open, save, message as showDialog, ask } from '@tauri-apps/plugin-dialog';
-import type { Stroke, ProcessingResult, TextRegion } from '../store';
+import type {
+  Stroke,
+  ProcessingResult,
+  TextRegion,
+  TextAnnotation,
+  DetectedShape,
+  ShapeType,
+} from '../store';
+
+/** Mirrors the Rust `Backup` struct. v1 files load with an empty text list. */
+export interface Backup {
+  version: number;
+  strokes: Stroke[];
+  text_annotations: TextAnnotation[];
+}
 
 export interface ExportOptions {
   filename: string;
@@ -71,6 +85,20 @@ export const api = {
     return safeInvoke('update_text_labels', { labels });
   },
 
+  /**
+   * Replace the backend's copy of the text typed with the text tool. Stored
+   * apart from the OCR regions so re-analysis cannot wipe it; both are merged
+   * when the .drawio file is written.
+   */
+  async syncTextAnnotations(annotations: TextAnnotation[]): Promise<number> {
+    return safeInvoke('sync_text_annotations', { annotations });
+  },
+
+  /** Override a misdetected shape's classification. Returns all shapes. */
+  async updateShapeType(shapeId: string, shapeType: ShapeType): Promise<DetectedShape[]> {
+    return safeInvoke('update_shape_type', { shapeId, shapeType });
+  },
+
   // LLM
   async enhanceWithLlm(prompt?: string): Promise<unknown> {
     return safeInvoke('enhance_with_llm', { prompt });
@@ -94,7 +122,7 @@ export const api = {
     return safeInvoke('save_backup', { path });
   },
 
-  async loadBackup(path: string): Promise<Stroke[]> {
+  async loadBackup(path: string): Promise<Backup> {
     return safeInvoke('load_backup', { path });
   },
 

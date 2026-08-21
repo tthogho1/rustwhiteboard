@@ -50,3 +50,6 @@ coverage
 *.pem
 *.drawio
 *.rwb.gz
+
+# Agent instructions (kept local)
+CLAUDE.md

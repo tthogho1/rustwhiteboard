@@ -167,6 +167,12 @@ pub fn generate_xml(
     // Write connectors
     write_connectors(&mut writer, shapes, &shape_id_map, &mut cell_id)?;
 
+    // Any remaining text becomes a standalone label
+    let orphans = write_orphan_text(&mut writer, shapes, text_regions, &mut cell_id)?;
+    if orphans > 0 {
+        println!("[DRAWIO] Wrote {} standalone text cells", orphans);
+    }
+
     // Close root
     writer
         .write_event(Event::End(BytesEnd::new("root")))
@@ -476,24 +482,88 @@ fn write_edge_cell(
 
 /// Find label text that belongs to a shape
 fn find_label_for_shape(shape: &DetectedShape, text_regions: &[TextRegion]) -> String {
-    let mut labels = Vec::new();
-
-    for text in text_regions {
-        // Check if text center is within shape bounds (with some margin)
-        let text_cx = text.bounds.x + text.bounds.width / 2.0;
-        let text_cy = text.bounds.y + text.bounds.height / 2.0;
-
-        let margin = 20.0;
-        if text_cx >= shape.bounds.x - margin
-            && text_cx <= shape.bounds.x + shape.bounds.width + margin
-            && text_cy >= shape.bounds.y - margin
-            && text_cy <= shape.bounds.y + shape.bounds.height + margin
-        {
-            labels.push(text.text.clone());
-        }
-    }
+    let labels: Vec<String> = text_regions
+        .iter()
+        .filter(|text| text_belongs_to_shape(text, shape))
+        .map(|text| text.text.clone())
+        .collect();
 
     labels.join("\\n")
+}
+
+/// Slack around a shape's bounds within which a text region still counts as
+/// that shape's label.
+const LABEL_MARGIN: f64 = 20.0;
+
+/// True when the text region's centre sits inside the shape (plus margin).
+fn text_belongs_to_shape(text: &TextRegion, shape: &DetectedShape) -> bool {
+    let text_cx = text.bounds.x + text.bounds.width / 2.0;
+    let text_cy = text.bounds.y + text.bounds.height / 2.0;
+
+    text_cx >= shape.bounds.x - LABEL_MARGIN
+        && text_cx <= shape.bounds.x + shape.bounds.width + LABEL_MARGIN
+        && text_cy >= shape.bounds.y - LABEL_MARGIN
+        && text_cy <= shape.bounds.y + shape.bounds.height + LABEL_MARGIN
+}
+
+/// Emit text that no shape claimed as its label as free-standing draw.io text
+/// cells. Without this, anything written outside a box is silently dropped from
+/// the export.
+fn write_orphan_text(
+    writer: &mut Writer<Cursor<Vec<u8>>>,
+    shapes: &[DetectedShape],
+    text_regions: &[TextRegion],
+    cell_id: &mut i32,
+) -> Result<usize, String> {
+    use crate::shapes::ShapeType;
+
+    // Connectors become edges, not vertices, so they never own a label here.
+    let containers: Vec<&DetectedShape> = shapes
+        .iter()
+        .filter(|s| {
+            !matches!(
+                s.shape_type,
+                ShapeType::Arrow | ShapeType::Line | ShapeType::Connector
+            )
+        })
+        .collect();
+
+    let mut written = 0;
+    for text in text_regions {
+        if text.text.trim().is_empty() {
+            continue;
+        }
+        if containers
+            .iter()
+            .any(|shape| text_belongs_to_shape(text, shape))
+        {
+            continue;
+        }
+
+        let current_id = cell_id.to_string();
+        let style = format!(
+            "text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=top;\
+whiteSpace=wrap;rounded=0;fontSize={};",
+            text.font_size_estimate.max(8.0).round() as i64
+        );
+
+        write_shape_cell(
+            writer,
+            &current_id,
+            "1",
+            &text.text,
+            &style,
+            text.bounds.x,
+            text.bounds.y,
+            text.bounds.width.max(40.0),
+            text.bounds.height.max(20.0),
+        )?;
+
+        *cell_id += 1;
+        written += 1;
+    }
+
+    Ok(written)
 }
 
 /// Get draw.io style string for shape type
@@ -745,6 +815,90 @@ mod tests {
         let xml = result.unwrap();
         assert!(xml.contains("mxfile"));
         assert!(xml.contains("mxGraphModel"));
+    }
+
+    fn text_region(id: &str, text: &str, x: f64, y: f64) -> TextRegion {
+        TextRegion {
+            id: id.to_string(),
+            text: text.to_string(),
+            bounds: crate::ocr::TextBounds {
+                x,
+                y,
+                width: 60.0,
+                height: 20.0,
+            },
+            confidence: 1.0,
+            font_size_estimate: 14.0,
+        }
+    }
+
+    fn boxed_shape(id: &str, x: f64, y: f64) -> DetectedShape {
+        DetectedShape {
+            id: id.to_string(),
+            shape_type: crate::shapes::ShapeType::Rectangle,
+            bounds: crate::shapes::ShapeBounds {
+                x,
+                y,
+                width: 200.0,
+                height: 100.0,
+                rotation: 0.0,
+            },
+            confidence: 1.0,
+            stroke_ids: vec![],
+            properties: crate::shapes::ShapeProperties {
+                center_x: x + 100.0,
+                center_y: y + 50.0,
+                radius: None,
+                start_point: None,
+                end_point: None,
+                corner_radius: None,
+                arrow_head: None,
+            },
+        }
+    }
+
+    fn test_options() -> ExportOptions {
+        ExportOptions {
+            filename: "test".to_string(),
+            include_grid: true,
+            page_width: 800.0,
+            page_height: 600.0,
+            theme: "light".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_text_inside_a_shape_becomes_its_label() {
+        let shapes = vec![boxed_shape("s1", 0.0, 0.0)];
+        // Centre at (80, 60) — well inside the 200x100 box.
+        let text_regions = vec![text_region("t1", "Start", 50.0, 50.0)];
+
+        let xml = generate_xml(&shapes, &text_regions, &test_options()).unwrap();
+
+        assert!(xml.contains("value=\"Start\""));
+        // Used as a label, so it must not also appear as a standalone text cell.
+        assert!(!xml.contains("strokeColor=none"));
+    }
+
+    #[test]
+    fn test_text_outside_every_shape_becomes_a_standalone_cell() {
+        let shapes = vec![boxed_shape("s1", 0.0, 0.0)];
+        let text_regions = vec![text_region("t1", "Note", 500.0, 400.0)];
+
+        let xml = generate_xml(&shapes, &text_regions, &test_options()).unwrap();
+
+        assert!(xml.contains("value=\"Note\""));
+        assert!(xml.contains("strokeColor=none"));
+    }
+
+    #[test]
+    fn test_blank_text_is_not_exported() {
+        let shapes = vec![];
+        let text_regions = vec![text_region("t1", "   ", 500.0, 400.0)];
+
+        let xml = generate_xml(&shapes, &text_regions, &test_options()).unwrap();
+
+        assert!(!xml.contains("strokeColor=none"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { loadAutosavedCanvas } from './lib/autosave';
 
 // Types
 export interface Point {
@@ -17,9 +18,44 @@ export interface Stroke {
   tool: string;
 }
 
+/** Mirrors `shapes::ShapeType` (serde `rename_all = "lowercase"`). */
+export type ShapeType =
+  | 'rectangle'
+  | 'circle'
+  | 'ellipse'
+  | 'triangle'
+  | 'diamond'
+  | 'arrow'
+  | 'line'
+  | 'connector'
+  | 'freeform';
+
+export const SHAPE_TYPES: ShapeType[] = [
+  'rectangle',
+  'circle',
+  'ellipse',
+  'triangle',
+  'diamond',
+  'arrow',
+  'line',
+  'connector',
+  'freeform',
+];
+
+/** Mirrors `shapes::ShapeProperties`. Tuples arrive as `[x, y]` arrays. */
+export interface ShapeProperties {
+  center_x: number;
+  center_y: number;
+  radius?: number | null;
+  start_point?: [number, number] | null;
+  end_point?: [number, number] | null;
+  corner_radius?: number | null;
+  arrow_head?: { style: string; size: number; direction: number } | null;
+}
+
 export interface DetectedShape {
   id: string;
-  shape_type: string;
+  shape_type: ShapeType;
   bounds: {
     x: number;
     y: number;
@@ -28,6 +64,20 @@ export interface DetectedShape {
     rotation: number;
   };
   confidence: number;
+  stroke_ids: string[];
+  properties: ShapeProperties;
+}
+
+/** Text typed with the text tool. Position and size are in canvas space. */
+export interface TextAnnotation {
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: string;
+  fontSize: number;
 }
 
 export interface TextRegion {
@@ -40,6 +90,7 @@ export interface TextRegion {
     height: number;
   };
   confidence: number;
+  font_size_estimate: number;
 }
 
 export interface ProcessingResult {
@@ -49,19 +100,32 @@ export interface ProcessingResult {
   confidence: number;
 }
 
-export type Tool = 'pen' | 'eraser' | 'select' | 'pan';
+export type Tool = 'pen' | 'eraser' | 'text' | 'select' | 'pan';
 export type Theme = 'light' | 'dark';
+
+/** One undo step: everything the canvas holds. */
+export interface CanvasSnapshot {
+  strokes: Stroke[];
+  textAnnotations: TextAnnotation[];
+}
 
 interface StoreState {
   // Canvas state
   strokes: Stroke[];
   currentStroke: Stroke | null;
+  textAnnotations: TextAnnotation[];
+  /** Annotation currently open in the inline editor, if any. */
+  editingTextId: string | null;
 
   // Tool state
   tool: Tool;
   penColor: string;
   penWidth: number;
   eraserWidth: number;
+  fontSize: number;
+
+  // Selection state (select tool)
+  selectedIds: string[];
 
   // View state
   zoom: number;
@@ -78,9 +142,13 @@ interface StoreState {
   // UI state
   theme: Theme;
   showGrid: boolean;
+  /** Draw the detected shape / text bounds on top of the canvas. */
+  showDetection: boolean;
+  /** Replace the freehand strokes with the clean detected geometry. */
+  cleanupView: boolean;
 
   // History for undo/redo
-  history: Stroke[][];
+  history: CanvasSnapshot[];
   historyIndex: number;
 
   // Actions
@@ -92,6 +160,9 @@ interface StoreState {
   setPan: (x: number, y: number) => void;
   setTheme: (theme: Theme) => void;
   setShowGrid: (show: boolean) => void;
+  setShowDetection: (show: boolean) => void;
+  setCleanupView: (show: boolean) => void;
+  setFontSize: (size: number) => void;
 
   // Stroke actions
   startStroke: (point: Point) => void;
@@ -101,6 +172,33 @@ interface StoreState {
   removeStroke: (id: string) => void;
   clearStrokes: () => void;
   setStrokes: (strokes: Stroke[]) => void;
+  /** Swap in a whole canvas (backup restore) as one undo step. */
+  replaceCanvas: (contents: CanvasSnapshot) => void;
+
+  // Text annotation actions
+  //
+  // These are all live edits and deliberately skip history: a keystroke is not
+  // an undo step. `finishTextEditing` closes the inline editor and pushes one
+  // snapshot for the whole edit.
+  addTextAnnotation: (annotation: TextAnnotation) => void;
+  updateTextAnnotation: (id: string, patch: Partial<TextAnnotation>) => void;
+  removeTextAnnotation: (id: string) => void;
+  setTextAnnotations: (annotations: TextAnnotation[]) => void;
+  moveTextAnnotation: (id: string, dx: number, dy: number) => void;
+  setEditingTextId: (id: string | null) => void;
+  finishTextEditing: () => void;
+
+  // Selection actions
+  setSelection: (ids: string[]) => void;
+  toggleSelection: (id: string) => void;
+  clearSelection: () => void;
+  selectAll: () => void;
+  /** Shift the selected strokes. Does not touch history — the caller commits
+   *  once when the drag ends, so a drag is a single undo step. */
+  moveSelected: (dx: number, dy: number) => void;
+  deleteSelected: () => void;
+  duplicateSelected: () => void;
+  restyleSelected: (style: { color?: string; width?: number }) => void;
 
   // History actions
   undo: () => void;
@@ -115,16 +213,25 @@ interface StoreState {
 
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
+/** Canvas-space offset applied to duplicated strokes so the copy is visible. */
+const DUPLICATE_OFFSET = 16;
+
+const restored = loadAutosavedCanvas();
+
 export const useStore = create<StoreState>()(
   persist(
     (set, get) => ({
       // Initial state
-      strokes: [],
+      strokes: restored.strokes,
       currentStroke: null,
+      textAnnotations: restored.textAnnotations,
+      editingTextId: null,
       tool: 'pen',
       penColor: '#000000',
       penWidth: 3,
       eraserWidth: 20,
+      fontSize: 16,
+      selectedIds: [],
       zoom: 1,
       panX: 0,
       panY: 0,
@@ -133,11 +240,18 @@ export const useStore = create<StoreState>()(
       isAnalysisStale: true,
       theme: 'light',
       showGrid: true,
-      history: [[]],
+      showDetection: false,
+      cleanupView: false,
+      history: [{ strokes: restored.strokes, textAnnotations: restored.textAnnotations }],
       historyIndex: 0,
 
       // Tool actions
-      setTool: tool => set({ tool }),
+      setTool: tool =>
+        set(state => ({
+          tool,
+          // A selection only means something while the select tool is active.
+          selectedIds: tool === 'select' ? state.selectedIds : [],
+        })),
       setPenColor: color => set({ penColor: color }),
       setPenWidth: width => set({ penWidth: width }),
       setEraserWidth: width => set({ eraserWidth: width }),
@@ -145,6 +259,9 @@ export const useStore = create<StoreState>()(
       setPan: (x, y) => set({ panX: x, panY: y }),
       setTheme: theme => set({ theme }),
       setShowGrid: show => set({ showGrid: show }),
+      setShowDetection: show => set({ showDetection: show }),
+      setCleanupView: show => set({ cleanupView: show }),
+      setFontSize: size => set({ fontSize: size }),
 
       // Stroke actions
       startStroke: point => {
@@ -173,7 +290,7 @@ export const useStore = create<StoreState>()(
       },
 
       endStroke: () => {
-        const { currentStroke, strokes, tool } = get();
+        const { currentStroke, strokes, tool, selectedIds } = get();
         if (currentStroke && currentStroke.points.length > 1) {
           if (tool === 'eraser') {
             // For eraser, find and remove intersecting strokes
@@ -181,10 +298,16 @@ export const useStore = create<StoreState>()(
             const remainingStrokes = strokes.filter(
               stroke => !strokesIntersect(stroke.points, eraserPath, currentStroke.width)
             );
+            const remainingIds = new Set(remainingStrokes.map(s => s.id));
+            const remainingText = get().textAnnotations.filter(
+              annotation => !pathCrossesBox(eraserPath, annotation, currentStroke.width)
+            );
             set({
               strokes: remainingStrokes,
+              textAnnotations: remainingText,
               currentStroke: null,
               isAnalysisStale: true,
+              selectedIds: selectedIds.filter(id => remainingIds.has(id)),
             });
           } else {
             set({
@@ -210,53 +333,212 @@ export const useStore = create<StoreState>()(
       removeStroke: id => {
         set(state => ({
           strokes: state.strokes.filter(s => s.id !== id),
+          selectedIds: state.selectedIds.filter(sid => sid !== id),
           isAnalysisStale: true,
         }));
         get().saveHistory();
       },
 
       clearStrokes: () => {
-        set({ strokes: [], processingResult: null, isAnalysisStale: true });
+        set({
+          strokes: [],
+          textAnnotations: [],
+          editingTextId: null,
+          selectedIds: [],
+          processingResult: null,
+          isAnalysisStale: true,
+        });
         get().saveHistory();
       },
 
       setStrokes: strokes => {
-        set({ strokes, processingResult: null, isAnalysisStale: true });
+        set({
+          strokes,
+          selectedIds: [],
+          processingResult: null,
+          isAnalysisStale: true,
+        });
+        get().saveHistory();
+      },
+
+      replaceCanvas: ({ strokes, textAnnotations }) => {
+        set({
+          strokes,
+          textAnnotations,
+          editingTextId: null,
+          selectedIds: [],
+          processingResult: null,
+          isAnalysisStale: true,
+        });
+        get().saveHistory();
+      },
+
+      // Text annotation actions
+      addTextAnnotation: annotation =>
+        set(state => ({ textAnnotations: [...state.textAnnotations, annotation] })),
+
+      updateTextAnnotation: (id, patch) =>
+        set(state => ({
+          textAnnotations: state.textAnnotations.map(a => (a.id === id ? { ...a, ...patch } : a)),
+        })),
+
+      removeTextAnnotation: id =>
+        set(state => ({
+          textAnnotations: state.textAnnotations.filter(a => a.id !== id),
+          editingTextId: state.editingTextId === id ? null : state.editingTextId,
+        })),
+
+      setTextAnnotations: annotations => {
+        set({ textAnnotations: annotations, editingTextId: null });
+        get().saveHistory();
+      },
+
+      moveTextAnnotation: (id, dx, dy) => {
+        if (dx === 0 && dy === 0) return;
+        set(state => ({
+          textAnnotations: state.textAnnotations.map(a =>
+            a.id === id ? { ...a, x: a.x + dx, y: a.y + dy } : a
+          ),
+        }));
+      },
+
+      setEditingTextId: id => set({ editingTextId: id }),
+
+      finishTextEditing: () => {
+        const { editingTextId, textAnnotations } = get();
+        if (!editingTextId) return;
+
+        const annotation = textAnnotations.find(a => a.id === editingTextId);
+        const remaining =
+          annotation && annotation.text.trim() === ''
+            ? textAnnotations.filter(a => a.id !== editingTextId)
+            : textAnnotations;
+
+        set({ editingTextId: null, textAnnotations: remaining });
+
+        // Opening and closing the editor without changing anything must not
+        // leave a no-op step in the undo stack.
+        const snapshot = get().history[get().historyIndex];
+        if (JSON.stringify(snapshot?.textAnnotations) !== JSON.stringify(remaining)) {
+          get().saveHistory();
+        }
+      },
+
+      // Selection actions
+      setSelection: ids => set({ selectedIds: ids }),
+
+      toggleSelection: id =>
+        set(state => ({
+          selectedIds: state.selectedIds.includes(id)
+            ? state.selectedIds.filter(sid => sid !== id)
+            : [...state.selectedIds, id],
+        })),
+
+      clearSelection: () => set({ selectedIds: [] }),
+
+      selectAll: () => set(state => ({ selectedIds: state.strokes.map(s => s.id) })),
+
+      moveSelected: (dx, dy) => {
+        if (dx === 0 && dy === 0) return;
+        set(state => {
+          if (state.selectedIds.length === 0) return state;
+          const selected = new Set(state.selectedIds);
+          return {
+            strokes: state.strokes.map(stroke =>
+              selected.has(stroke.id)
+                ? {
+                    ...stroke,
+                    points: stroke.points.map(p => ({ ...p, x: p.x + dx, y: p.y + dy })),
+                  }
+                : stroke
+            ),
+            isAnalysisStale: true,
+          };
+        });
+      },
+
+      deleteSelected: () => {
+        const { selectedIds } = get();
+        if (selectedIds.length === 0) return;
+        const selected = new Set(selectedIds);
+        set(state => ({
+          strokes: state.strokes.filter(s => !selected.has(s.id)),
+          selectedIds: [],
+          isAnalysisStale: true,
+        }));
+        get().saveHistory();
+      },
+
+      duplicateSelected: () => {
+        const { strokes, selectedIds } = get();
+        if (selectedIds.length === 0) return;
+
+        const selected = new Set(selectedIds);
+        const copies = strokes
+          .filter(s => selected.has(s.id))
+          .map(stroke => ({
+            ...stroke,
+            id: generateId(),
+            points: stroke.points.map(p => ({
+              ...p,
+              x: p.x + DUPLICATE_OFFSET,
+              y: p.y + DUPLICATE_OFFSET,
+            })),
+          }));
+
+        set({
+          strokes: [...strokes, ...copies],
+          // Leave the copies selected so they can be dragged straight away.
+          selectedIds: copies.map(s => s.id),
+          isAnalysisStale: true,
+        });
+        get().saveHistory();
+      },
+
+      restyleSelected: ({ color, width }) => {
+        const { selectedIds } = get();
+        if (selectedIds.length === 0 || (color === undefined && width === undefined)) return;
+
+        const selected = new Set(selectedIds);
+        set(state => ({
+          strokes: state.strokes.map(stroke =>
+            selected.has(stroke.id)
+              ? {
+                  ...stroke,
+                  color: color ?? stroke.color,
+                  width: width ?? stroke.width,
+                }
+              : stroke
+          ),
+          // Width changes the stroke bounds, so detection has to run again.
+          isAnalysisStale: width !== undefined ? true : state.isAnalysisStale,
+        }));
         get().saveHistory();
       },
 
       // History actions
       saveHistory: () => {
-        const { strokes, history, historyIndex } = get();
+        const { strokes, textAnnotations, history, historyIndex } = get();
         const newHistory = history.slice(0, historyIndex + 1);
-        newHistory.push([...strokes]);
+        newHistory.push({ strokes: [...strokes], textAnnotations: [...textAnnotations] });
+        // Trim first, then index into the trimmed list — otherwise the index
+        // points past the end once more than 50 states have accumulated.
+        const trimmed = newHistory.slice(-50);
         set({
-          history: newHistory.slice(-50), // Keep last 50 states
-          historyIndex: newHistory.length - 1,
+          history: trimmed,
+          historyIndex: trimmed.length - 1,
         });
       },
 
       undo: () => {
         const { history, historyIndex } = get();
-        if (historyIndex > 0) {
-          const newIndex = historyIndex - 1;
-          set({
-            strokes: [...history[newIndex]],
-            historyIndex: newIndex,
-            isAnalysisStale: true,
-          });
-        }
+        if (historyIndex > 0) restoreSnapshot(set, history[historyIndex - 1], historyIndex - 1);
       },
 
       redo: () => {
         const { history, historyIndex } = get();
         if (historyIndex < history.length - 1) {
-          const newIndex = historyIndex + 1;
-          set({
-            strokes: [...history[newIndex]],
-            historyIndex: newIndex,
-            isAnalysisStale: true,
-          });
+          restoreSnapshot(set, history[historyIndex + 1], historyIndex + 1);
         }
       },
 
@@ -267,6 +549,9 @@ export const useStore = create<StoreState>()(
     }),
     {
       name: 'rustwhiteboard-storage',
+      // Strokes are deliberately *not* persisted here: this middleware writes on
+      // every set(), which includes each pointermove. They go through the
+      // debounced autosave in lib/autosave.ts instead.
       partialize: state => ({
         theme: state.theme,
         penColor: state.penColor,
@@ -276,6 +561,37 @@ export const useStore = create<StoreState>()(
     }
   )
 );
+
+type SetState = (
+  updater: (state: StoreState) => Partial<StoreState>
+) => void;
+
+function restoreSnapshot(set: SetState, snapshot: CanvasSnapshot, index: number) {
+  const ids = new Set(snapshot.strokes.map(s => s.id));
+  set(state => ({
+    strokes: [...snapshot.strokes],
+    textAnnotations: [...snapshot.textAnnotations],
+    editingTextId: null,
+    historyIndex: index,
+    isAnalysisStale: true,
+    selectedIds: state.selectedIds.filter(id => ids.has(id)),
+  }));
+}
+
+/** True when any point of the path lands inside the box (plus threshold). */
+function pathCrossesBox(
+  path: Point[],
+  box: { x: number; y: number; width: number; height: number },
+  threshold: number
+): boolean {
+  return path.some(
+    p =>
+      p.x >= box.x - threshold &&
+      p.x <= box.x + box.width + threshold &&
+      p.y >= box.y - threshold &&
+      p.y <= box.y + box.height + threshold
+  );
+}
 
 // Helper function to check if two stroke paths intersect
 function strokesIntersect(path1: Point[], path2: Point[], threshold: number): boolean {
