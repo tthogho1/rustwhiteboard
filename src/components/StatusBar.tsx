@@ -1,7 +1,20 @@
 import { useStore } from '../store';
 
 export function StatusBar() {
-  const { strokes, zoom, panX, panY, tool, isProcessing, processingResult } = useStore();
+  const {
+    strokes,
+    zoom,
+    panX,
+    panY,
+    tool,
+    selectedIds,
+    textAnnotations,
+    isProcessing,
+    processingResult,
+    isAnalysisStale,
+    showDetection,
+    cleanupView,
+  } = useStore();
 
   const strokeCount = strokes.length;
   const pointCount = strokes.reduce((sum, s) => sum + s.points.length, 0);
@@ -21,6 +34,16 @@ export function StatusBar() {
         <span className="status-item">
           Points: <strong>{pointCount}</strong>
         </span>
+        {textAnnotations.length > 0 && (
+          <span className="status-item">
+            Text: <strong>{textAnnotations.length}</strong>
+          </span>
+        )}
+        {selectedIds.length > 0 && (
+          <span className="status-item">
+            Selected: <strong>{selectedIds.length}</strong>
+          </span>
+        )}
       </div>
 
       <div className="status-section">
@@ -43,6 +66,11 @@ export function StatusBar() {
           <span className="status-item">
             Type: <strong>{processingResult.suggested_diagram_type}</strong>
           </span>
+          {isAnalysisStale && (showDetection || cleanupView) && (
+            <span className="status-item stale" title="The canvas changed since the last Analyze">
+              ⚠ stale
+            </span>
+          )}
         </div>
       )}
 
@@ -54,7 +82,9 @@ export function StatusBar() {
 
       <div className="status-section right">
         <span className="status-item hint">
-          Ctrl+Scroll: Zoom | Middle-click: Pan | Ctrl+Z/Y: Undo/Redo
+          {tool === 'select'
+            ? 'Drag: rubber-band | Shift+click: add | Delete: remove | Ctrl+D: duplicate'
+            : 'Ctrl+Scroll: Zoom | Middle-click: Pan | Ctrl+Z: Undo | ⌨️ for all shortcuts'}
         </span>
       </div>
     </div>

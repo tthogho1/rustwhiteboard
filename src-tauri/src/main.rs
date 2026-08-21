@@ -23,6 +23,12 @@ pub struct AppState {
     pub detected_shapes: Mutex<Vec<shapes::DetectedShape>>,
     /// OCR results
     pub ocr_text: Mutex<Vec<ocr::TextRegion>>,
+    /// Text typed with the frontend text tool.
+    ///
+    /// Kept apart from `ocr_text` because `process_canvas` overwrites that on
+    /// every run — annotations are owned by the frontend and must survive
+    /// re-analysis. The two are merged at export time.
+    pub text_annotations: Mutex<Vec<TextAnnotation>>,
     /// LLM configuration
     pub llm_config: Mutex<llm::LlmConfig>,
 }
@@ -33,6 +39,7 @@ impl Default for AppState {
             strokes: Mutex::new(Vec::new()),
             detected_shapes: Mutex::new(Vec::new()),
             ocr_text: Mutex::new(Vec::new()),
+            text_annotations: Mutex::new(Vec::new()),
             llm_config: Mutex::new(llm::LlmConfig::default()),
         }
     }
@@ -55,6 +62,54 @@ pub struct Stroke {
     pub color: String,
     pub width: f64,
     pub tool: String,
+}
+
+/// Text typed with the frontend text tool.
+///
+/// Mirrors `TextAnnotation` in `src/store.ts`. `fontSize` keeps its camelCase
+/// name (unlike the rest of the boundary) so annotations round-trip through
+/// backups byte-for-byte instead of needing a conversion on each side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextAnnotation {
+    pub id: String,
+    pub text: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub color: String,
+    #[serde(rename = "fontSize")]
+    pub font_size: f64,
+}
+
+impl TextAnnotation {
+    /// The shape the labelling and export code works in.
+    fn to_text_region(&self) -> ocr::TextRegion {
+        ocr::TextRegion {
+            id: self.id.clone(),
+            text: self.text.clone(),
+            bounds: ocr::TextBounds {
+                x: self.x,
+                y: self.y,
+                width: self.width,
+                height: self.height,
+            },
+            // Typed text is exact, unlike an OCR guess.
+            confidence: 1.0,
+            font_size_estimate: self.font_size,
+        }
+    }
+}
+
+/// On-disk backup format.
+///
+/// v1 backups were a bare `Vec<Stroke>`; `load_backup` still reads those.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Backup {
+    pub version: u32,
+    pub strokes: Vec<Stroke>,
+    #[serde(default)]
+    pub text_annotations: Vec<TextAnnotation>,
 }
 
 /// Result of diagram processing
@@ -118,6 +173,8 @@ async fn clear_strokes(state: State<'_, AppState>) -> Result<(), String> {
     shapes.clear();
     let mut text = state.ocr_text.lock().map_err(|e| e.to_string())?;
     text.clear();
+    let mut annotations = state.text_annotations.lock().map_err(|e| e.to_string())?;
+    annotations.clear();
     Ok(())
 }
 
@@ -237,6 +294,54 @@ async fn update_text_labels(
     Ok(regions.clone())
 }
 
+/// Replace the text typed with the frontend text tool.
+///
+/// Like `sync_strokes` this replaces wholesale: the frontend store owns the
+/// annotations, so pushing them again must stay idempotent.
+#[tauri::command]
+async fn sync_text_annotations(
+    state: State<'_, AppState>,
+    annotations: Vec<TextAnnotation>,
+) -> Result<usize, String> {
+    let mut current = state.text_annotations.lock().map_err(|e| e.to_string())?;
+    println!(
+        "[TEXT] sync_text_annotations: {} -> {} annotations",
+        current.len(),
+        annotations.len()
+    );
+    *current = annotations;
+    Ok(current.len())
+}
+
+/// Correct the type of an already-detected shape.
+///
+/// Detection is never going to be perfect on freehand input, so the preview
+/// lets the user override a classification. Like the label corrections this
+/// only survives while the analysis is not re-run (see `ensureAnalyzed`).
+#[tauri::command]
+async fn update_shape_type(
+    state: State<'_, AppState>,
+    shape_id: String,
+    shape_type: shapes::ShapeType,
+) -> Result<Vec<shapes::DetectedShape>, String> {
+    let mut detected = state.detected_shapes.lock().map_err(|e| e.to_string())?;
+
+    let shape = detected
+        .iter_mut()
+        .find(|s| s.id == shape_id)
+        .ok_or_else(|| format!("No detected shape with id {}", shape_id))?;
+
+    println!(
+        "[PROCESS] update_shape_type: {} {:?} -> {:?}",
+        shape_id, shape.shape_type, shape_type
+    );
+    shape.shape_type = shape_type;
+    // A hand-picked type is certain by definition.
+    shape.confidence = 1.0;
+
+    Ok(detected.clone())
+}
+
 /// Generate draw.io XML from the processed diagram
 #[tauri::command]
 async fn generate_drawio(
@@ -244,9 +349,23 @@ async fn generate_drawio(
     options: ExportOptions,
 ) -> Result<String, String> {
     let shapes = state.detected_shapes.lock().map_err(|e| e.to_string())?;
-    let text_regions = state.ocr_text.lock().map_err(|e| e.to_string())?;
+    let ocr_regions = state.ocr_text.lock().map_err(|e| e.to_string())?;
+    let annotations = state.text_annotations.lock().map_err(|e| e.to_string())?;
 
-    println!("[DRAWIO] generate_drawio: {} shapes, {} text_regions", shapes.len(), text_regions.len());
+    // Typed text goes last so it wins the label slot when it overlaps an OCR
+    // region for the same shape.
+    let text_regions: Vec<ocr::TextRegion> = ocr_regions
+        .iter()
+        .cloned()
+        .chain(annotations.iter().map(TextAnnotation::to_text_region))
+        .collect();
+
+    println!(
+        "[DRAWIO] generate_drawio: {} shapes, {} ocr regions, {} annotations",
+        shapes.len(),
+        ocr_regions.len(),
+        annotations.len()
+    );
     for shape in shapes.iter() {
         println!("[DRAWIO]   Shape: {:?} at ({}, {}) {}x{}", 
             shape.shape_type, shape.bounds.x, shape.bounds.y, 
@@ -305,8 +424,16 @@ async fn save_backup(
     use flate2::Compression;
     use std::io::Write;
 
-    let strokes = state.strokes.lock().map_err(|e| e.to_string())?;
-    let json = serde_json::to_string(&*strokes)
+    let backup = {
+        let strokes = state.strokes.lock().map_err(|e| e.to_string())?;
+        let annotations = state.text_annotations.lock().map_err(|e| e.to_string())?;
+        Backup {
+            version: 2,
+            strokes: strokes.clone(),
+            text_annotations: annotations.clone(),
+        }
+    };
+    let json = serde_json::to_string(&backup)
         .map_err(|e| format!("Failed to serialize: {}", e))?;
 
     let file = std::fs::File::create(&path)
@@ -325,7 +452,7 @@ async fn save_backup(
 async fn load_backup(
     state: State<'_, AppState>,
     path: String,
-) -> Result<Vec<Stroke>, String> {
+) -> Result<Backup, String> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -336,13 +463,31 @@ async fn load_backup(
     decoder.read_to_string(&mut json)
         .map_err(|e| format!("Failed to read: {}", e))?;
 
-    let strokes: Vec<Stroke> = serde_json::from_str(&json)
-        .map_err(|e| format!("Failed to deserialize: {}", e))?;
+    // v1 backups are a bare stroke array; fall back to that shape.
+    let backup: Backup = match serde_json::from_str::<Backup>(&json) {
+        Ok(backup) => backup,
+        Err(_) => {
+            let strokes: Vec<Stroke> = serde_json::from_str(&json)
+                .map_err(|e| format!("Failed to deserialize: {}", e))?;
+            println!("[BACKUP] loaded a v1 backup ({} strokes, no text)", strokes.len());
+            Backup {
+                version: 1,
+                strokes,
+                text_annotations: Vec::new(),
+            }
+        }
+    };
 
-    let mut state_strokes = state.strokes.lock().map_err(|e| e.to_string())?;
-    *state_strokes = strokes.clone();
+    {
+        let mut state_strokes = state.strokes.lock().map_err(|e| e.to_string())?;
+        *state_strokes = backup.strokes.clone();
+    }
+    {
+        let mut state_text = state.text_annotations.lock().map_err(|e| e.to_string())?;
+        *state_text = backup.text_annotations.clone();
+    }
 
-    Ok(strokes)
+    Ok(backup)
 }
 
 /// Get application info
@@ -375,6 +520,8 @@ fn main() {
             process_canvas,
             enhance_with_llm,
             update_text_labels,
+            sync_text_annotations,
+            update_shape_type,
             generate_drawio,
             export_drawio_file,
             configure_llm,
@@ -389,6 +536,65 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_v1_backup_without_text_still_loads() {
+        // v1 files are a bare stroke array, which must not fail the v2 struct.
+        // Extra hashes: the JSON itself contains a `"#` sequence.
+        let legacy = r##"[{"id":"s1","points":[],"color":"#000","width":2.0,"tool":"pen"}]"##;
+
+        assert!(serde_json::from_str::<Backup>(legacy).is_err());
+
+        let strokes: Vec<Stroke> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(strokes.len(), 1);
+    }
+
+    #[test]
+    fn test_backup_round_trips_text_annotations() {
+        let backup = Backup {
+            version: 2,
+            strokes: vec![],
+            text_annotations: vec![TextAnnotation {
+                id: "a1".to_string(),
+                text: "Start".to_string(),
+                x: 10.0,
+                y: 20.0,
+                width: 40.0,
+                height: 18.0,
+                color: "#000000".to_string(),
+                font_size: 16.0,
+            }],
+        };
+
+        let json = serde_json::to_string(&backup).unwrap();
+        // The frontend spells this one camelCase; keep it that way on disk.
+        assert!(json.contains("\"fontSize\":16.0"));
+
+        let parsed: Backup = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.text_annotations[0].text, "Start");
+        assert_eq!(parsed.text_annotations[0].font_size, 16.0);
+    }
+
+    #[test]
+    fn test_annotation_becomes_a_text_region() {
+        let annotation = TextAnnotation {
+            id: "a1".to_string(),
+            text: "Done".to_string(),
+            x: 5.0,
+            y: 6.0,
+            width: 30.0,
+            height: 20.0,
+            color: "#ff0000".to_string(),
+            font_size: 14.0,
+        };
+
+        let region = annotation.to_text_region();
+        assert_eq!(region.id, "a1");
+        assert_eq!(region.bounds.x, 5.0);
+        assert_eq!(region.bounds.height, 20.0);
+        assert_eq!(region.font_size_estimate, 14.0);
+        assert_eq!(region.confidence, 1.0);
+    }
 
     #[test]
     fn test_point_creation() {

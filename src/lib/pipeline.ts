@@ -9,6 +9,17 @@ function getCanvas(): HTMLCanvasElement {
 }
 
 /**
+ * Push everything the canvas holds to the backend: the strokes detection runs
+ * on, and the typed text the export merges in. Annotations sit outside the
+ * detection cycle, so they are pushed even when detection itself is skipped.
+ */
+export async function syncCanvas(): Promise<void> {
+  const { strokes, textAnnotations } = useStore.getState();
+  await api.syncStrokes(strokes);
+  await api.syncTextAnnotations(textAnnotations);
+}
+
+/**
  * Push the canvas strokes to the backend and make sure the shapes / text it
  * holds actually describe them.
  *
@@ -19,10 +30,10 @@ function getCanvas(): HTMLCanvasElement {
 export async function ensureAnalyzed(
   options: { force?: boolean } = {}
 ): Promise<ProcessingResult | null> {
-  const { strokes, processingResult, isAnalysisStale, setProcessingResult, setAnalysisStale } =
+  const { processingResult, isAnalysisStale, setProcessingResult, setAnalysisStale } =
     useStore.getState();
 
-  await api.syncStrokes(strokes);
+  await syncCanvas();
 
   if (!options.force && processingResult && !isAnalysisStale) {
     return processingResult;

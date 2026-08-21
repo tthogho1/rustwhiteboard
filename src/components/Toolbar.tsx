@@ -1,9 +1,10 @@
 import { useCallback, useState, useRef } from 'react';
 import { useStore, Tool } from '../store';
 import { invoke } from '@tauri-apps/api/core';
-import { save } from '@tauri-apps/plugin-dialog';
 import { api } from '../lib/api';
 import { ensureAnalyzed } from '../lib/pipeline';
+import { clearCanvas, exportDrawio, restoreBackup, saveBackup } from '../lib/actions';
+import { SHORTCUT_HELP } from '../lib/useKeyboardShortcuts';
 import type { LlmConfig } from '../lib/api';
 
 interface ToolbarProps {
@@ -25,9 +26,19 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
     setTheme,
     showGrid,
     setShowGrid,
+    showDetection,
+    setShowDetection,
+    cleanupView,
+    setCleanupView,
+    fontSize,
+    setFontSize,
+    processingResult,
     strokes,
-    clearStrokes,
-    setStrokes,
+    selectedIds,
+    deleteSelected,
+    duplicateSelected,
+    restyleSelected,
+    clearSelection,
     undo,
     redo,
     history,
@@ -46,13 +57,16 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
   const [llmApiKey, setLlmApiKey] = useState('');
   const [llmModelName, setLlmModelName] = useState('gpt-4o');
   const [llmConfigured, setLlmConfigured] = useState(false);
+  const [showShortcuts, setShowShortcuts] = useState(false);
   const settingsBtnRef = useRef<HTMLButtonElement>(null);
+  const shortcutsBtnRef = useRef<HTMLButtonElement>(null);
 
   const tools: { id: Tool; icon: string; label: string }[] = [
-    { id: 'pen', icon: '✏️', label: 'Pen' },
-    { id: 'eraser', icon: '🧹', label: 'Eraser' },
-    { id: 'select', icon: '👆', label: 'Select' },
-    { id: 'pan', icon: '✋', label: 'Pan' },
+    { id: 'pen', icon: '✏️', label: 'Pen (P)' },
+    { id: 'eraser', icon: '🧹', label: 'Eraser (E)' },
+    { id: 'text', icon: '🔤', label: 'Text (T)' },
+    { id: 'select', icon: '👆', label: 'Select (V)' },
+    { id: 'pan', icon: '✋', label: 'Pan (H)' },
   ];
 
   const colors = [
@@ -156,102 +170,9 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
     }
   }, [strokes, llmPrompt, llmBackend, llmApiKey, llmModelName, llmConfigured, setProcessing, onTogglePreview]);
 
-  const handleExport = useCallback(async () => {
-    if (strokes.length === 0) {
-      alert('Please draw something first!');
-      return;
-    }
-
-    try {
-      const filePath = await save({
-        filters: [
-          {
-            name: 'Draw.io',
-            extensions: ['drawio'],
-          },
-        ],
-        defaultPath: 'diagram.drawio',
-      });
-
-      if (!filePath) return;
-
-      // Ensure the backend holds shapes matching the canvas. Already-analyzed
-      // canvases are not re-detected, so label corrections survive the export.
-      await ensureAnalyzed();
-
-      await invoke('export_drawio_file', {
-        path: filePath,
-        options: {
-          filename: 'Untitled',
-          include_grid: true,
-          page_width: 1920,
-          page_height: 1080,
-          theme: theme,
-        },
-      });
-
-      alert(`Exported to ${filePath}`);
-    } catch (error) {
-      console.error('Export failed:', error);
-      alert(`Export failed: ${error}`);
-    }
-  }, [strokes, theme]);
-
-  const handleClear = useCallback(async () => {
-    clearStrokes();
-    try {
-      await api.clearStrokes();
-    } catch (error) {
-      // The canvas is already cleared; a stale backend only matters on re-analysis.
-      console.error('Failed to clear backend state:', error);
-    }
-  }, [clearStrokes]);
-
-  const handleSaveBackup = useCallback(async () => {
-    try {
-      const filePath = await save({
-        filters: [
-          {
-            name: 'Whiteboard Backup',
-            extensions: ['rwb.gz'],
-          },
-        ],
-        defaultPath: 'whiteboard-backup.rwb.gz',
-      });
-
-      if (!filePath) return;
-
-      await invoke('save_backup', { path: filePath });
-      alert('Backup saved!');
-    } catch (error) {
-      console.error('Backup failed:', error);
-      alert(`Backup failed: ${error}`);
-    }
-  }, []);
-
-  const handleLoadBackup = useCallback(async () => {
-    try {
-      const filePath = await api.openFile([
-        { name: 'Whiteboard Backup', extensions: ['gz', 'rwb'] },
-      ]);
-      if (!filePath) return;
-
-      if (strokes.length > 0) {
-        const proceed = await api.confirm(
-          'Restore Backup',
-          'This replaces everything currently on the canvas. Continue?'
-        );
-        if (!proceed) return;
-      }
-
-      const restored = await api.loadBackup(filePath);
-      setStrokes(restored);
-      alert(`Restored ${restored.length} strokes.`);
-    } catch (error) {
-      console.error('Restore failed:', error);
-      alert(`Restore failed: ${error}`);
-    }
-  }, [strokes, setStrokes]);
+  const handleApplyStyleToSelection = useCallback(() => {
+    restyleSelected({ color: penColor, width: penWidth });
+  }, [restyleSelected, penColor, penWidth]);
 
   const handleResetView = useCallback(() => {
     setZoom(1);
@@ -277,6 +198,47 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
         </div>
       </div>
 
+      {/* Selection actions (select tool only) */}
+      {tool === 'select' && (
+        <div className="toolbar-group">
+          <span className="toolbar-label">Selection ({selectedIds.length})</span>
+          <div className="toolbar-buttons">
+            <button
+              className="toolbar-btn"
+              onClick={duplicateSelected}
+              disabled={selectedIds.length === 0}
+              title="Duplicate selection (Ctrl+D)"
+            >
+              ⧉
+            </button>
+            <button
+              className="toolbar-btn"
+              onClick={handleApplyStyleToSelection}
+              disabled={selectedIds.length === 0}
+              title="Apply the current color and width to the selection"
+            >
+              🎨
+            </button>
+            <button
+              className="toolbar-btn"
+              onClick={clearSelection}
+              disabled={selectedIds.length === 0}
+              title="Clear selection (Esc)"
+            >
+              ✖
+            </button>
+            <button
+              className="toolbar-btn danger"
+              onClick={deleteSelected}
+              disabled={selectedIds.length === 0}
+              title="Delete selection (Delete)"
+            >
+              🗑️
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Color picker */}
       <div className="toolbar-group">
         <span className="toolbar-label">Color</span>
@@ -300,39 +262,70 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
         </div>
       </div>
 
-      {/* Pen width */}
-      <div className="toolbar-group">
-        <span className="toolbar-label">Width</span>
-        <input
-          type="range"
-          min="1"
-          max="20"
-          value={penWidth}
-          onChange={e => setPenWidth(Number(e.target.value))}
-          className="width-slider"
-        />
-        <span className="width-value">{penWidth}px</span>
-      </div>
+      {/* Pen width / font size */}
+      {tool === 'text' ? (
+        <div className="toolbar-group">
+          <span className="toolbar-label">Font</span>
+          <input
+            type="range"
+            min="10"
+            max="48"
+            value={fontSize}
+            onChange={e => setFontSize(Number(e.target.value))}
+            className="width-slider"
+          />
+          <span className="width-value">{fontSize}px</span>
+        </div>
+      ) : (
+        <div className="toolbar-group">
+          <span className="toolbar-label">Width</span>
+          <input
+            type="range"
+            min="1"
+            max="20"
+            value={penWidth}
+            onChange={e => setPenWidth(Number(e.target.value))}
+            className="width-slider"
+          />
+          <span className="width-value">{penWidth}px</span>
+        </div>
+      )}
 
       {/* View controls */}
       <div className="toolbar-group">
         <span className="toolbar-label">View</span>
         <div className="toolbar-buttons">
-          <button className="toolbar-btn" onClick={() => setZoom(zoom * 1.2)} title="Zoom In">
+          <button className="toolbar-btn" onClick={() => setZoom(zoom * 1.2)} title="Zoom In (Ctrl +)">
             🔍+
           </button>
-          <button className="toolbar-btn" onClick={() => setZoom(zoom / 1.2)} title="Zoom Out">
+          <button className="toolbar-btn" onClick={() => setZoom(zoom / 1.2)} title="Zoom Out (Ctrl -)">
             🔍-
           </button>
-          <button className="toolbar-btn" onClick={handleResetView} title="Reset View">
+          <button className="toolbar-btn" onClick={handleResetView} title="Reset View (Ctrl+0)">
             🎯
           </button>
           <button
             className={`toolbar-btn ${showGrid ? 'active' : ''}`}
             onClick={() => setShowGrid(!showGrid)}
-            title="Toggle Grid"
+            title="Toggle Grid (G)"
           >
             #
+          </button>
+          <button
+            className={`toolbar-btn ${showDetection ? 'active' : ''}`}
+            onClick={() => setShowDetection(!showDetection)}
+            disabled={!processingResult}
+            title="Show what was detected, on the canvas (O) — run Analyze first"
+          >
+            🔎
+          </button>
+          <button
+            className={`toolbar-btn ${cleanupView ? 'active' : ''}`}
+            onClick={() => setCleanupView(!cleanupView)}
+            disabled={!processingResult}
+            title="Clean-up view: draw the detected shapes straightened (C)"
+          >
+            ✨
           </button>
         </div>
         <span className="zoom-value">{Math.round(zoom * 100)}%</span>
@@ -354,11 +347,11 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
             className="toolbar-btn"
             onClick={redo}
             disabled={historyIndex >= history.length - 1}
-            title="Redo (Ctrl+Y)"
+            title="Redo (Ctrl+Shift+Z)"
           >
             ↪️
           </button>
-          <button className="toolbar-btn danger" onClick={handleClear} title="Clear All">
+          <button className="toolbar-btn danger" onClick={clearCanvas} title="Clear All">
             🗑️
           </button>
         </div>
@@ -376,7 +369,7 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
           >
             {isProcessing ? '⏳' : '🔍'} Analyze
           </button>
-          <button className="toolbar-btn" onClick={onTogglePreview} title="Show Preview">
+          <button className="toolbar-btn" onClick={onTogglePreview} title="Show Preview (Ctrl+P)">
             👁️ Preview
           </button>
         </div>
@@ -416,28 +409,69 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
       <div className="toolbar-group">
         <span className="toolbar-label">Export</span>
         <div className="toolbar-buttons">
-          <button className="toolbar-btn success" onClick={handleExport} title="Export to .drawio">
+          <button className="toolbar-btn success" onClick={exportDrawio} title="Export to .drawio (Ctrl+E)">
             📥 .drawio
           </button>
-          <button className="toolbar-btn" onClick={handleSaveBackup} title="Save Backup">
+          <button className="toolbar-btn" onClick={saveBackup} title="Save Backup (Ctrl+S)">
             💾 Backup
           </button>
-          <button className="toolbar-btn" onClick={handleLoadBackup} title="Restore Backup">
+          <button className="toolbar-btn" onClick={restoreBackup} title="Restore Backup">
             📂 Restore
           </button>
         </div>
       </div>
 
-      {/* Theme */}
+      {/* Theme + shortcuts */}
       <div className="toolbar-group">
-        <button
-          className="toolbar-btn"
-          onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-          title="Toggle Theme"
-        >
-          {theme === 'light' ? '🌙' : '☀️'}
-        </button>
+        <div className="toolbar-buttons">
+          <button
+            className="toolbar-btn"
+            onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+            title="Toggle Theme"
+          >
+            {theme === 'light' ? '🌙' : '☀️'}
+          </button>
+          <button
+            ref={shortcutsBtnRef}
+            className={`toolbar-btn ${showShortcuts ? 'active' : ''}`}
+            onClick={() => setShowShortcuts(!showShortcuts)}
+            title="Keyboard shortcuts"
+          >
+            ⌨️
+          </button>
+        </div>
       </div>
+
+      {/* Shortcut cheat sheet */}
+      {showShortcuts && (() => {
+        const rect = shortcutsBtnRef.current?.getBoundingClientRect();
+        const top = rect ? rect.bottom + 4 : 60;
+        const right = rect ? Math.max(8, window.innerWidth - rect.right) : 16;
+        return (
+          <>
+            <div
+              style={{ position: 'fixed', inset: 0, zIndex: 9998 }}
+              onClick={() => setShowShortcuts(false)}
+            />
+            <div className="shortcut-help" style={{ top: `${top}px`, right: `${right}px` }}>
+              <div className="shortcut-help-title">Keyboard shortcuts</div>
+              <table>
+                <tbody>
+                  {SHORTCUT_HELP.map(item => (
+                    <tr key={item.keys}>
+                      <th>{item.keys}</th>
+                      <td>{item.action}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="shortcut-help-note">
+                Select tool: drag to rubber-band, Shift+click to add, drag the box to move.
+              </div>
+            </div>
+          </>
+        );
+      })()}
 
       {/* LLM Settings Panel - rendered as fixed overlay to escape toolbar overflow clipping */}
       {showLlmSettings && (() => {
