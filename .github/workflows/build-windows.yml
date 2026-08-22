@@ -1,0 +1,56 @@
+name: Build (Windows)
+
+# Cross-compiling Tauri from macOS is not supported (WebView2 and the resource
+# compiler need the MSVC toolchain), so the Windows bundle is built here.
+on:
+  workflow_dispatch:
+  push:
+    branches: [QA, main]
+    paths-ignore:
+      - '**.md'
+
+# A newer push supersedes an in-flight build of the same branch.
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The crate is not in a workspace root — it lives in src-tauri/.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features openai
+
+      - name: Build the Windows bundle
+        uses: tauri-apps/tauri-action@v0
+        with:
+          # `ocr` is left off deliberately: linking Tesseract on Windows needs
+          # a system install the runner does not have, and OCR falls back
+          # gracefully without it.
+          args: --features openai
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RustWhiteboard-windows
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14
