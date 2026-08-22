@@ -20,7 +20,8 @@ dist-ssr
 # Rust
 target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed on purpose: this repo ships a binary, so builds
+# (CI included) must resolve the same dependency versions every time.
 
 # Tauri
 src-tauri/target/
