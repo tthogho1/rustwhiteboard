@@ -1,5 +1,25 @@
+import { getStroke } from 'perfect-freehand';
 import type { DetectedShape, ProcessingResult, Stroke, TextAnnotation, Theme } from '../store';
 import { fontFor, LINE_HEIGHT } from './text';
+
+/** perfect-freehand settings. Shared so the canvas, PNG and SVG all agree. */
+export const FREEHAND_OPTIONS = {
+  thinning: 0.5,
+  smoothing: 0.5,
+  streamline: 0.5,
+};
+
+/** Outline polygon of a stroke, in canvas coordinates. */
+export function strokeOutline(stroke: Stroke): number[][] {
+  return getStroke(
+    stroke.points.map(p => [p.x, p.y, p.pressure ?? 0.5]),
+    {
+      ...FREEHAND_OPTIONS,
+      size: stroke.width,
+      simulatePressure: !stroke.points[0]?.pressure,
+    }
+  );
+}
 
 export interface View {
   zoom: number;
@@ -29,6 +49,34 @@ function begin(ctx: CanvasRenderingContext2D, view: View) {
 /** Canvas-space size that renders at `px` screen pixels whatever the zoom. */
 function screenUnits(px: number, view: View): number {
   return px / view.zoom;
+}
+
+/** Draw one freehand stroke. `alpha` fades the strokes no shape claimed. */
+export function drawStroke(
+  ctx: CanvasRenderingContext2D,
+  stroke: Stroke | null,
+  view: View,
+  alpha = 1
+) {
+  if (!stroke || stroke.points.length < 2) return;
+
+  const outline = strokeOutline(stroke);
+  if (outline.length < 2) return;
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(view.panX, view.panY);
+  ctx.scale(view.zoom, view.zoom);
+
+  ctx.fillStyle = stroke.color;
+  ctx.beginPath();
+  ctx.moveTo(outline[0][0], outline[0][1]);
+  for (let i = 1; i < outline.length; i++) {
+    ctx.lineTo(outline[i][0], outline[i][1]);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
 }
 
 // ---------------------------------------------------------------------------

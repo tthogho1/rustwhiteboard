@@ -232,3 +232,28 @@ export function rectsOverlap(a: Rect, b: Rect): boolean {
     a.y + a.height > b.y
   );
 }
+
+/**
+ * Bounding box of everything drawn, with a margin. Used to frame the image
+ * exports, which crop to the drawing rather than the current viewport.
+ */
+export function contentBounds(
+  strokes: Stroke[],
+  annotations: TextAnnotation[],
+  padding = 24
+): Rect | null {
+  const rects: Rect[] = [
+    ...strokes.filter(s => s.points.length > 0).map(strokeBounds),
+    ...annotations.filter(a => a.text.length > 0).map(annotationBounds),
+  ];
+
+  const union = unionRects(rects);
+  if (!union) return null;
+
+  return {
+    x: union.x - padding,
+    y: union.y - padding,
+    width: union.width + padding * 2,
+    height: union.height + padding * 2,
+  };
+}

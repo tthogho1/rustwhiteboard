@@ -7,6 +7,7 @@
 
 mod canvas;
 mod drawio;
+mod import;
 mod llm;
 mod ocr;
 mod shapes;
@@ -427,6 +428,71 @@ async fn export_drawio_file(
     Ok(())
 }
 
+/// Write a PNG rendered by the frontend canvas.
+///
+/// The image arrives as a data URL because that is what `canvas.toDataURL`
+/// produces; writing the bytes here keeps every export on the same path as
+/// `export_drawio_file` and sidesteps the fs plugin's scope checks for a path
+/// the user picked in a save dialog.
+#[tauri::command]
+async fn export_png_file(path: String, image_data: String) -> Result<(), String> {
+    let base64_part = image_data
+        .split_once("base64,")
+        .map(|(_, data)| data)
+        .unwrap_or(&image_data);
+
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_part)
+        .map_err(|e| format!("Failed to decode the image: {}", e))?;
+
+    std::fs::write(&path, &bytes).map_err(|e| format!("Failed to write file: {}", e))?;
+    println!("[EXPORT] wrote {} bytes of PNG to {}", bytes.len(), path);
+    Ok(())
+}
+
+/// Write an SVG document built by the frontend.
+#[tauri::command]
+async fn export_svg_file(path: String, svg: String) -> Result<(), String> {
+    std::fs::write(&path, svg.as_bytes()).map_err(|e| format!("Failed to write file: {}", e))?;
+    println!("[EXPORT] wrote {} bytes of SVG to {}", svg.len(), path);
+    Ok(())
+}
+
+/// Read a .drawio file back onto the canvas as strokes and text.
+#[tauri::command]
+async fn import_drawio_file(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<import::CanvasData, String> {
+    let xml = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let data = import::parse_drawio(&xml)?;
+    println!(
+        "[IMPORT] {}: {} strokes, {} text annotations",
+        path,
+        data.strokes.len(),
+        data.text_annotations.len()
+    );
+
+    // Mirror the new canvas into the backend so an export before the next
+    // Analyze still has something to work from.
+    {
+        let mut strokes = state.strokes.lock().map_err(|e| e.to_string())?;
+        *strokes = data.strokes.clone();
+    }
+    {
+        let mut annotations = state.text_annotations.lock().map_err(|e| e.to_string())?;
+        *annotations = data.text_annotations.clone();
+    }
+    {
+        let mut shapes = state.detected_shapes.lock().map_err(|e| e.to_string())?;
+        shapes.clear();
+        let mut ocr = state.ocr_text.lock().map_err(|e| e.to_string())?;
+        ocr.clear();
+    }
+
+    Ok(data)
+}
+
 /// Configure LLM settings
 #[tauri::command]
 async fn configure_llm(
@@ -549,6 +615,9 @@ fn main() {
             delete_shape,
             generate_drawio,
             export_drawio_file,
+            export_png_file,
+            export_svg_file,
+            import_drawio_file,
             configure_llm,
             save_backup,
             load_backup,

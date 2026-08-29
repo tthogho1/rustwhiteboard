@@ -3,7 +3,15 @@ import { useStore, Tool } from '../store';
 import { invoke } from '@tauri-apps/api/core';
 import { api } from '../lib/api';
 import { ensureAnalyzed } from '../lib/pipeline';
-import { clearCanvas, exportDrawio, restoreBackup, saveBackup } from '../lib/actions';
+import {
+  clearCanvas,
+  exportDrawio,
+  exportPng,
+  exportSvg,
+  importDrawio,
+  restoreBackup,
+  saveBackup,
+} from '../lib/actions';
 import { SHORTCUT_HELP } from '../lib/useKeyboardShortcuts';
 import type { LlmConfig } from '../lib/api';
 
@@ -411,6 +419,34 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
         <div className="toolbar-buttons">
           <button className="toolbar-btn success" onClick={exportDrawio} title="Export to .drawio (Ctrl+E)">
             📥 .drawio
+          </button>
+          <button
+            className="toolbar-btn"
+            onClick={exportPng}
+            title="Export a PNG, cropped to the drawing (follows the clean-up view)"
+          >
+            🖼️ PNG
+          </button>
+          <button
+            className="toolbar-btn"
+            onClick={exportSvg}
+            title="Export an SVG, cropped to the drawing (follows the clean-up view)"
+          >
+            ⬡ SVG
+          </button>
+        </div>
+      </div>
+
+      {/* File */}
+      <div className="toolbar-group">
+        <span className="toolbar-label">File</span>
+        <div className="toolbar-buttons">
+          <button
+            className="toolbar-btn"
+            onClick={importDrawio}
+            title="Import a .drawio file back onto the canvas"
+          >
+            📄 Import
           </button>
           <button className="toolbar-btn" onClick={saveBackup} title="Save Backup (Ctrl+S)">
             💾 Backup

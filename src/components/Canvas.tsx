@@ -1,6 +1,5 @@
 import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
 import { useStore, Point } from '../store';
-import { getStroke } from 'perfect-freehand';
 import {
   annotationBounds,
   hitTestAnnotation,
@@ -17,6 +16,7 @@ import {
 import {
   drawCleanShapes,
   drawDetectionOverlay,
+  drawStroke,
   drawTextAnnotations,
   leftoverStrokes,
   type View,
@@ -152,47 +152,6 @@ export function Canvas() {
     [showGrid, theme, zoom, panX, panY]
   );
 
-  // Draw a single stroke
-  const drawStroke = useCallback(
-    (ctx: CanvasRenderingContext2D, stroke: typeof currentStroke, alpha = 1) => {
-      if (!stroke || stroke.points.length < 2) return;
-
-      ctx.save();
-      ctx.globalAlpha = alpha;
-      ctx.translate(panX, panY);
-      ctx.scale(zoom, zoom);
-
-      // Use perfect-freehand for smooth stroke rendering
-      const strokePoints = stroke.points.map(p => [p.x, p.y, p.pressure ?? 0.5]);
-
-      const outlinePoints = getStroke(strokePoints, {
-        size: stroke.width,
-        thinning: 0.5,
-        smoothing: 0.5,
-        streamline: 0.5,
-        simulatePressure: !stroke.points[0]?.pressure,
-      });
-
-      if (outlinePoints.length < 2) {
-        ctx.restore();
-        return;
-      }
-
-      ctx.fillStyle = stroke.color;
-      ctx.beginPath();
-      ctx.moveTo(outlinePoints[0][0], outlinePoints[0][1]);
-
-      for (let i = 1; i < outlinePoints.length; i++) {
-        ctx.lineTo(outlinePoints[i][0], outlinePoints[i][1]);
-      }
-
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
-    },
-    [zoom, panX, panY]
-  );
-
   // Selection highlight + rubber-band rectangle, both in canvas coordinates
   const drawSelectionOverlay = useCallback(
     (ctx: CanvasRenderingContext2D) => {
@@ -258,17 +217,17 @@ export function Canvas() {
       // anything unrecognised stays visible, faded, so nothing disappears.
       drawCleanShapes(ctx, processingResult.shapes, view, theme);
       for (const stroke of leftoverStrokes(strokes, processingResult.shapes)) {
-        drawStroke(ctx, stroke, 0.25);
+        drawStroke(ctx, stroke, view, 0.25);
       }
     } else {
       for (const stroke of strokes) {
-        drawStroke(ctx, stroke);
+        drawStroke(ctx, stroke, view);
       }
     }
 
     // Draw current stroke
     if (currentStroke) {
-      drawStroke(ctx, currentStroke);
+      drawStroke(ctx, currentStroke, view);
     }
 
     drawTextAnnotations(ctx, textAnnotations, view, editingTextId);
@@ -284,7 +243,6 @@ export function Canvas() {
     drawGrid,
     strokes,
     currentStroke,
-    drawStroke,
     drawSelectionOverlay,
     textAnnotations,
     editingTextId,
