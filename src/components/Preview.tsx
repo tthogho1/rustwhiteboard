@@ -62,6 +62,21 @@ export function Preview({ onClose }: PreviewProps) {
     [processingResult, setProcessingResult]
   );
 
+  const handleDeleteShape = useCallback(
+    async (shapeId: string) => {
+      try {
+        const shapes = await api.deleteShape(shapeId);
+        if (processingResult) {
+          setProcessingResult({ ...processingResult, shapes });
+        }
+      } catch (error) {
+        console.error('Failed to delete the shape:', error);
+        alert(`Failed to delete the shape: ${error}`);
+      }
+    },
+    [processingResult, setProcessingResult]
+  );
+
   const handleAnnotationEdit = useCallback(
     (id: string, text: string, fontSize: number) => {
       const { width, height } = measureText(text, fontSize);
@@ -190,6 +205,13 @@ export function Preview({ onClose }: PreviewProps) {
                       ))}
                     </select>
                     <span className="shape-confidence">{Math.round(shape.confidence * 100)}%</span>
+                    <button
+                      className="text-delete"
+                      onClick={() => handleDeleteShape(shape.id)}
+                      title="Drop this detection (the strokes stay)"
+                    >
+                      ×
+                    </button>
                   </div>
                   <div className="shape-details">
                     <span>

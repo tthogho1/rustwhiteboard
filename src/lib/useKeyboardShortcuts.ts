@@ -106,7 +106,10 @@ export function useKeyboardShortcuts({ onTogglePreview }: ShortcutHandlers) {
           }
           return;
         case 'Escape':
-          if (state.selectedIds.length > 0) {
+          if (state.selectedShapeId) {
+            e.preventDefault();
+            state.setSelectedShapeId(null);
+          } else if (state.selectedIds.length > 0) {
             e.preventDefault();
             state.clearSelection();
           }

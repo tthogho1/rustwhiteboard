@@ -9,11 +9,15 @@ import type {
   ShapeType,
 } from '../store';
 
-/** Mirrors the Rust `Backup` struct. v1 files load with an empty text list. */
-export interface Backup {
-  version: number;
+/** Mirrors the Rust `import::CanvasData` struct. */
+export interface CanvasData {
   strokes: Stroke[];
   text_annotations: TextAnnotation[];
+}
+
+/** Mirrors the Rust `Backup` struct. v1 files load with an empty text list. */
+export interface Backup extends CanvasData {
+  version: number;
 }
 
 export interface ExportOptions {
@@ -99,6 +103,11 @@ export const api = {
     return safeInvoke('update_shape_type', { shapeId, shapeType });
   },
 
+  /** Drop a spurious detection so it stays out of the export. Returns all shapes. */
+  async deleteShape(shapeId: string): Promise<DetectedShape[]> {
+    return safeInvoke('delete_shape', { shapeId });
+  },
+
   // LLM
   async enhanceWithLlm(prompt?: string): Promise<unknown> {
     return safeInvoke('enhance_with_llm', { prompt });
@@ -115,6 +124,20 @@ export const api = {
 
   async exportDrawioFile(path: string, options: ExportOptions): Promise<void> {
     return safeInvoke('export_drawio_file', { path, options });
+  },
+
+  /** `imageData` is a `canvas.toDataURL('image/png')` string. */
+  async exportPngFile(path: string, imageData: string): Promise<void> {
+    return safeInvoke('export_png_file', { path, imageData });
+  },
+
+  async exportSvgFile(path: string, svg: string): Promise<void> {
+    return safeInvoke('export_svg_file', { path, svg });
+  },
+
+  /** Read a .drawio file back as strokes and text annotations. */
+  async importDrawioFile(path: string): Promise<CanvasData> {
+    return safeInvoke('import_drawio_file', { path });
   },
 
   // Backup

@@ -2,6 +2,9 @@ import { useStore } from '../store';
 import { api } from './api';
 import { ensureAnalyzed, syncCanvas } from './pipeline';
 import { clearAutosave } from './autosave';
+import { renderPngDataUrl, type ExportSource } from './imageExport';
+import { toSvg } from './svg';
+import { withMeasuredSize } from './text';
 import type { ExportOptions } from './api';
 
 /**
@@ -42,6 +45,116 @@ export async function exportDrawio(): Promise<void> {
   } catch (error) {
     console.error('Export failed:', error);
     alert(`Export failed: ${error}`);
+  }
+}
+
+/**
+ * What the image exports draw. Mirrors the canvas: with the clean-up view on
+ * they get the straightened geometry, otherwise the freehand strokes.
+ */
+function exportSource(): ExportSource {
+  const { strokes, textAnnotations, theme, cleanupView, processingResult } = useStore.getState();
+  const shapes = processingResult?.shapes ?? [];
+
+  return {
+    strokes,
+    textAnnotations,
+    cleanShapes: cleanupView && shapes.length > 0 ? shapes : null,
+    theme,
+  };
+}
+
+function isEmptyCanvas(): boolean {
+  const { strokes, textAnnotations } = useStore.getState();
+  if (strokes.length === 0 && textAnnotations.length === 0) {
+    alert('Please draw something first!');
+    return true;
+  }
+  return false;
+}
+
+export async function exportPng(): Promise<void> {
+  if (isEmptyCanvas()) return;
+
+  try {
+    const dataUrl = renderPngDataUrl(exportSource());
+    if (!dataUrl) {
+      alert('Nothing to export.');
+      return;
+    }
+
+    const filePath = await api.saveFile('diagram.png', [
+      { name: 'PNG Image', extensions: ['png'] },
+    ]);
+    if (!filePath) return;
+
+    await api.exportPngFile(filePath, dataUrl);
+    alert(`Exported to ${filePath}`);
+  } catch (error) {
+    console.error('PNG export failed:', error);
+    alert(`PNG export failed: ${error}`);
+  }
+}
+
+export async function exportSvg(): Promise<void> {
+  if (isEmptyCanvas()) return;
+
+  try {
+    const svg = toSvg(exportSource());
+    if (!svg) {
+      alert('Nothing to export.');
+      return;
+    }
+
+    const filePath = await api.saveFile('diagram.svg', [
+      { name: 'SVG Image', extensions: ['svg'] },
+    ]);
+    if (!filePath) return;
+
+    await api.exportSvgFile(filePath, svg);
+    alert(`Exported to ${filePath}`);
+  } catch (error) {
+    console.error('SVG export failed:', error);
+    alert(`SVG export failed: ${error}`);
+  }
+}
+
+/**
+ * Read a .drawio file onto the canvas. The shapes come back as strokes tracing
+ * their outlines, so everything stays editable and a re-run of Analyze detects
+ * them again.
+ */
+export async function importDrawio(): Promise<void> {
+  const { strokes, textAnnotations, replaceCanvas } = useStore.getState();
+
+  try {
+    const filePath = await api.openFile([
+      { name: 'Draw.io', extensions: ['drawio', 'xml'] },
+    ]);
+    if (!filePath) return;
+
+    if (strokes.length > 0 || textAnnotations.length > 0) {
+      const proceed = await api.confirm(
+        'Import .drawio',
+        'This replaces everything currently on the canvas. Continue?'
+      );
+      if (!proceed) return;
+    }
+
+    const data = await api.importDrawioFile(filePath);
+    replaceCanvas({
+      strokes: data.strokes,
+      // The backend can only estimate text sizes; measure them for real so hit
+      // testing and the exported bounds match what gets drawn.
+      textAnnotations: data.text_annotations.map(withMeasuredSize),
+    });
+
+    alert(
+      `Imported ${data.strokes.length} shapes and ${data.text_annotations.length} labels.`
+    );
+  } catch (error) {
+    console.error('Import failed:', error);
+    alert(`Import failed: ${error}`);
   }
 }
 
