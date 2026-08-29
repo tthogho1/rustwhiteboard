@@ -76,7 +76,8 @@ export function drawDetectionOverlay(
   ctx: CanvasRenderingContext2D,
   result: ProcessingResult,
   view: View,
-  isStale: boolean
+  isStale: boolean,
+  selectedShapeId?: string | null
 ) {
   begin(ctx, view);
   ctx.lineWidth = screenUnits(1.5, view);
@@ -90,9 +91,13 @@ export function drawDetectionOverlay(
   for (const shape of result.shapes) {
     const color = confidenceColor(shape.confidence);
     const { x, y, width, height } = shape.bounds;
+    const picked = shape.id === selectedShapeId;
 
+    // The one being corrected gets a solid, heavier outline so it stands out
+    // from the dashed boxes around it.
     ctx.strokeStyle = color;
-    ctx.setLineDash([screenUnits(5, view), screenUnits(3, view)]);
+    ctx.lineWidth = screenUnits(picked ? 3 : 1.5, view);
+    if (!picked) ctx.setLineDash([screenUnits(5, view), screenUnits(3, view)]);
     ctx.strokeRect(x, y, width, height);
     ctx.setLineDash([]);
 
@@ -104,6 +109,8 @@ export function drawDetectionOverlay(
       y - labelGap
     );
   }
+
+  ctx.lineWidth = screenUnits(1.5, view);
 
   for (const region of result.text_regions) {
     const { x, y, width, height } = region.bounds;

@@ -2,13 +2,16 @@ import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
 import { useStore, Point } from '../store';
 import { getStroke } from 'perfect-freehand';
 import {
+  annotationBounds,
   hitTestAnnotation,
+  hitTestDetection,
   hitTestStroke,
   rectContains,
   rectFromCorners,
+  rectsOverlap,
+  selectionBounds,
   strokeBounds,
   strokeIntersectsRect,
-  unionBounds,
   type Rect,
 } from '../lib/geometry';
 import {
@@ -20,6 +23,7 @@ import {
 } from '../lib/render';
 import { createTextAnnotation } from '../lib/text';
 import { TextEditor } from './TextEditor';
+import { ShapeInspector } from './ShapeInspector';
 
 const GRID_SIZE = 20;
 /** Screen-pixel slack around a stroke that still counts as a click on it. */
@@ -68,6 +72,8 @@ export function Canvas() {
     cleanupView,
     processingResult,
     isAnalysisStale,
+    selectedShapeId,
+    setSelectedShapeId,
     addTextAnnotation,
     setEditingTextId,
     finishTextEditing,
@@ -191,8 +197,11 @@ export function Canvas() {
   const drawSelectionOverlay = useCallback(
     (ctx: CanvasRenderingContext2D) => {
       const selectedSet = new Set(selectedIds);
-      const selected = strokes.filter(s => selectedSet.has(s.id));
-      if (selected.length === 0 && !marquee) return;
+      const boxes: Rect[] = [
+        ...strokes.filter(s => selectedSet.has(s.id)).map(strokeBounds),
+        ...textAnnotations.filter(a => selectedSet.has(a.id)).map(annotationBounds),
+      ];
+      if (boxes.length === 0 && !marquee) return;
 
       ctx.save();
       ctx.translate(panX, panY);
@@ -200,14 +209,13 @@ export function Canvas() {
       // Keep outlines one screen pixel wide whatever the zoom is.
       ctx.lineWidth = 1 / zoom;
 
-      if (selected.length > 0) {
+      if (boxes.length > 0) {
         ctx.fillStyle = theme === 'dark' ? 'rgba(77, 166, 255, 0.14)' : 'rgba(0, 102, 204, 0.10)';
-        for (const stroke of selected) {
-          const b = strokeBounds(stroke);
+        for (const b of boxes) {
           ctx.fillRect(b.x, b.y, b.width, b.height);
         }
 
-        const union = unionBounds(selected);
+        const union = selectionBounds(strokes, textAnnotations, selectedIds);
         if (union) {
           ctx.setLineDash([6 / zoom, 4 / zoom]);
           ctx.strokeStyle = accentColor;
@@ -227,7 +235,7 @@ export function Canvas() {
 
       ctx.restore();
     },
-    [strokes, selectedIds, marquee, theme, accentColor, zoom, panX, panY]
+    [strokes, textAnnotations, selectedIds, marquee, theme, accentColor, zoom, panX, panY]
   );
 
   // Main render function
@@ -266,7 +274,7 @@ export function Canvas() {
     drawTextAnnotations(ctx, textAnnotations, view, editingTextId);
 
     if (showDetection && processingResult) {
-      drawDetectionOverlay(ctx, processingResult, view, isAnalysisStale);
+      drawDetectionOverlay(ctx, processingResult, view, isAnalysisStale, selectedShapeId);
     }
 
     drawSelectionOverlay(ctx);
@@ -284,6 +292,7 @@ export function Canvas() {
     showClean,
     processingResult,
     isAnalysisStale,
+    selectedShapeId,
     view,
   ]);
 
@@ -314,14 +323,18 @@ export function Canvas() {
   // rubber-banding a new one.
   const beginSelectGesture = useCallback(
     (point: Point, additive: boolean) => {
-      const hit = hitTestStroke(strokes, point.x, point.y, HIT_SLOP_PX / zoom);
-      const wasSelected = hit ? selectedIds.includes(hit.id) : false;
+      const slop = HIT_SLOP_PX / zoom;
+      // Annotations render on top of the strokes, so they win a contested click.
+      const annotation = hitTestAnnotation(textAnnotations, point.x, point.y, slop);
+      const stroke = annotation ? null : hitTestStroke(strokes, point.x, point.y, slop);
+      const hitId = annotation?.id ?? stroke?.id ?? null;
+      const wasSelected = hitId !== null && selectedIds.includes(hitId);
 
       let mode: DragMode = 'marquee';
 
-      if (hit) {
+      if (hitId) {
         if (additive) {
-          toggleSelection(hit.id);
+          toggleSelection(hitId);
           if (wasSelected) {
             // Shift+click took it out of the selection — no drag follows.
             dragState.current = null;
@@ -329,12 +342,12 @@ export function Canvas() {
             return;
           }
         } else if (!wasSelected) {
-          setSelection([hit.id]);
+          setSelection([hitId]);
         }
         mode = 'move';
       } else {
-        const selectionBounds = unionBounds(strokes.filter(s => selectedIds.includes(s.id)));
-        if (!additive && selectionBounds && rectContains(selectionBounds, point.x, point.y)) {
+        const bounds = selectionBounds(strokes, textAnnotations, selectedIds);
+        if (!additive && bounds && rectContains(bounds, point.x, point.y)) {
           // Empty spot inside the selection box still grabs the selection.
           mode = 'move';
         } else if (!additive) {
@@ -351,7 +364,7 @@ export function Canvas() {
       };
       setIsDraggingSelection(mode === 'move');
     },
-    [strokes, selectedIds, zoom, setSelection, toggleSelection, clearSelection]
+    [strokes, textAnnotations, selectedIds, zoom, setSelection, toggleSelection, clearSelection]
   );
 
   // Pointer event handlers
@@ -370,7 +383,26 @@ export function Canvas() {
       }
 
       if (tool === 'select') {
-        beginSelectGesture(screenToCanvas(e.clientX, e.clientY), e.shiftKey);
+        const point = screenToCanvas(e.clientX, e.clientY);
+
+        // While the overlay is up, its boxes are clickable targets in their own
+        // right — but only on the border, so the strokes inside stay reachable.
+        if (showDetection && processingResult) {
+          const detection = hitTestDetection(
+            processingResult.shapes,
+            point.x,
+            point.y,
+            HIT_SLOP_PX / zoom
+          );
+          if (detection) {
+            setSelectedShapeId(detection.id);
+            clearSelection();
+            return;
+          }
+        }
+        setSelectedShapeId(null);
+
+        beginSelectGesture(point, e.shiftKey);
         return;
       }
 
@@ -412,6 +444,10 @@ export function Canvas() {
       screenToCanvas,
       startStroke,
       beginSelectGesture,
+      showDetection,
+      processingResult,
+      setSelectedShapeId,
+      clearSelection,
       zoom,
       penColor,
       fontSize,
@@ -512,7 +548,12 @@ export function Canvas() {
         } else {
           if (drag.moved) {
             const rect = rectFromCorners(drag.origin, drag.last);
-            const hits = strokes.filter(s => strokeIntersectsRect(s, rect)).map(s => s.id);
+            const hits = [
+              ...strokes.filter(s => strokeIntersectsRect(s, rect)).map(s => s.id),
+              ...textAnnotations
+                .filter(a => rectsOverlap(annotationBounds(a), rect))
+                .map(a => a.id),
+            ];
             const merged = new Set([...drag.baseSelection, ...hits]);
             setSelection([...merged]);
           }
@@ -526,7 +567,16 @@ export function Canvas() {
         endStroke();
       }
     },
-    [isPanning, isDrawing, endStroke, strokes, setSelection, saveHistory, setEditingTextId]
+    [
+      isPanning,
+      isDrawing,
+      endStroke,
+      strokes,
+      textAnnotations,
+      setSelection,
+      saveHistory,
+      setEditingTextId,
+    ]
   );
 
   // Wheel handler for zoom
@@ -593,6 +643,7 @@ export function Canvas() {
         onContextMenu={e => e.preventDefault()}
       />
       <TextEditor />
+      <ShapeInspector />
     </div>
   );
 }

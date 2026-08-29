@@ -99,6 +99,11 @@ export const api = {
     return safeInvoke('update_shape_type', { shapeId, shapeType });
   },
 
+  /** Drop a spurious detection so it stays out of the export. Returns all shapes. */
+  async deleteShape(shapeId: string): Promise<DetectedShape[]> {
+    return safeInvoke('delete_shape', { shapeId });
+  },
+
   // LLM
   async enhanceWithLlm(prompt?: string): Promise<unknown> {
     return safeInvoke('enhance_with_llm', { prompt });

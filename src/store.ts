@@ -125,7 +125,11 @@ interface StoreState {
   fontSize: number;
 
   // Selection state (select tool)
+  /** Ids of the selected strokes *and* text annotations — the two id spaces
+   *  are disjoint, so one list covers both. */
   selectedIds: string[];
+  /** Detected shape picked on the detection overlay, for correcting it. */
+  selectedShapeId: string | null;
 
   // View state
   zoom: number;
@@ -199,6 +203,7 @@ interface StoreState {
   deleteSelected: () => void;
   duplicateSelected: () => void;
   restyleSelected: (style: { color?: string; width?: number }) => void;
+  setSelectedShapeId: (id: string | null) => void;
 
   // History actions
   undo: () => void;
@@ -232,6 +237,7 @@ export const useStore = create<StoreState>()(
       eraserWidth: 20,
       fontSize: 16,
       selectedIds: [],
+      selectedShapeId: null,
       zoom: 1,
       panX: 0,
       panY: 0,
@@ -259,7 +265,10 @@ export const useStore = create<StoreState>()(
       setPan: (x, y) => set({ panX: x, panY: y }),
       setTheme: theme => set({ theme }),
       setShowGrid: show => set({ showGrid: show }),
-      setShowDetection: show => set({ showDetection: show }),
+      setShowDetection: show =>
+        // Hiding the overlay must take the correction panel with it — the panel
+        // is anchored to a box that is no longer on screen.
+        set(show ? { showDetection: true } : { showDetection: false, selectedShapeId: null }),
       setCleanupView: show => set({ cleanupView: show }),
       setFontSize: size => set({ fontSize: size }),
 
@@ -298,7 +307,6 @@ export const useStore = create<StoreState>()(
             const remainingStrokes = strokes.filter(
               stroke => !strokesIntersect(stroke.points, eraserPath, currentStroke.width)
             );
-            const remainingIds = new Set(remainingStrokes.map(s => s.id));
             const remainingText = get().textAnnotations.filter(
               annotation => !pathCrossesBox(eraserPath, annotation, currentStroke.width)
             );
@@ -307,7 +315,7 @@ export const useStore = create<StoreState>()(
               textAnnotations: remainingText,
               currentStroke: null,
               isAnalysisStale: true,
-              selectedIds: selectedIds.filter(id => remainingIds.has(id)),
+              selectedIds: pruneSelection(selectedIds, remainingStrokes, remainingText),
             });
           } else {
             set({
@@ -345,6 +353,7 @@ export const useStore = create<StoreState>()(
           textAnnotations: [],
           editingTextId: null,
           selectedIds: [],
+          selectedShapeId: null,
           processingResult: null,
           isAnalysisStale: true,
         });
@@ -355,6 +364,7 @@ export const useStore = create<StoreState>()(
         set({
           strokes,
           selectedIds: [],
+          selectedShapeId: null,
           processingResult: null,
           isAnalysisStale: true,
         });
@@ -367,6 +377,7 @@ export const useStore = create<StoreState>()(
           textAnnotations,
           editingTextId: null,
           selectedIds: [],
+          selectedShapeId: null,
           processingResult: null,
           isAnalysisStale: true,
         });
@@ -436,7 +447,13 @@ export const useStore = create<StoreState>()(
 
       clearSelection: () => set({ selectedIds: [] }),
 
-      selectAll: () => set(state => ({ selectedIds: state.strokes.map(s => s.id) })),
+      selectAll: () =>
+        set(state => ({
+          selectedIds: [
+            ...state.strokes.map(s => s.id),
+            ...state.textAnnotations.map(a => a.id),
+          ],
+        })),
 
       moveSelected: (dx, dy) => {
         if (dx === 0 && dy === 0) return;
@@ -452,6 +469,11 @@ export const useStore = create<StoreState>()(
                   }
                 : stroke
             ),
+            textAnnotations: state.textAnnotations.map(annotation =>
+              selected.has(annotation.id)
+                ? { ...annotation, x: annotation.x + dx, y: annotation.y + dy }
+                : annotation
+            ),
             isAnalysisStale: true,
           };
         });
@@ -463,6 +485,7 @@ export const useStore = create<StoreState>()(
         const selected = new Set(selectedIds);
         set(state => ({
           strokes: state.strokes.filter(s => !selected.has(s.id)),
+          textAnnotations: state.textAnnotations.filter(a => !selected.has(a.id)),
           selectedIds: [],
           isAnalysisStale: true,
         }));
@@ -470,11 +493,11 @@ export const useStore = create<StoreState>()(
       },
 
       duplicateSelected: () => {
-        const { strokes, selectedIds } = get();
+        const { strokes, textAnnotations, selectedIds } = get();
         if (selectedIds.length === 0) return;
 
         const selected = new Set(selectedIds);
-        const copies = strokes
+        const strokeCopies = strokes
           .filter(s => selected.has(s.id))
           .map(stroke => ({
             ...stroke,
@@ -485,11 +508,20 @@ export const useStore = create<StoreState>()(
               y: p.y + DUPLICATE_OFFSET,
             })),
           }));
+        const textCopies = textAnnotations
+          .filter(a => selected.has(a.id))
+          .map(annotation => ({
+            ...annotation,
+            id: generateId(),
+            x: annotation.x + DUPLICATE_OFFSET,
+            y: annotation.y + DUPLICATE_OFFSET,
+          }));
 
         set({
-          strokes: [...strokes, ...copies],
+          strokes: [...strokes, ...strokeCopies],
+          textAnnotations: [...textAnnotations, ...textCopies],
           // Leave the copies selected so they can be dragged straight away.
-          selectedIds: copies.map(s => s.id),
+          selectedIds: [...strokeCopies.map(s => s.id), ...textCopies.map(a => a.id)],
           isAnalysisStale: true,
         });
         get().saveHistory();
@@ -510,11 +542,20 @@ export const useStore = create<StoreState>()(
                 }
               : stroke
           ),
+          // Only the colour carries over to text; `width` is a pen concept.
+          textAnnotations:
+            color === undefined
+              ? state.textAnnotations
+              : state.textAnnotations.map(annotation =>
+                  selected.has(annotation.id) ? { ...annotation, color } : annotation
+                ),
           // Width changes the stroke bounds, so detection has to run again.
           isAnalysisStale: width !== undefined ? true : state.isAnalysisStale,
         }));
         get().saveHistory();
       },
+
+      setSelectedShapeId: id => set({ selectedShapeId: id }),
 
       // History actions
       saveHistory: () => {
@@ -544,7 +585,15 @@ export const useStore = create<StoreState>()(
 
       // Processing actions
       setProcessing: processing => set({ isProcessing: processing }),
-      setProcessingResult: result => set({ processingResult: result }),
+      setProcessingResult: result =>
+        set(state => ({
+          processingResult: result,
+          // The picked shape may not exist in the new result.
+          selectedShapeId:
+            state.selectedShapeId && result?.shapes.some(s => s.id === state.selectedShapeId)
+              ? state.selectedShapeId
+              : null,
+        })),
       setAnalysisStale: stale => set({ isAnalysisStale: stale }),
     }),
     {
@@ -567,15 +616,27 @@ type SetState = (
 ) => void;
 
 function restoreSnapshot(set: SetState, snapshot: CanvasSnapshot, index: number) {
-  const ids = new Set(snapshot.strokes.map(s => s.id));
   set(state => ({
     strokes: [...snapshot.strokes],
     textAnnotations: [...snapshot.textAnnotations],
     editingTextId: null,
     historyIndex: index,
     isAnalysisStale: true,
-    selectedIds: state.selectedIds.filter(id => ids.has(id)),
+    selectedIds: pruneSelection(state.selectedIds, snapshot.strokes, snapshot.textAnnotations),
   }));
+}
+
+/** Drop selected ids whose stroke or annotation no longer exists. */
+function pruneSelection(
+  ids: string[],
+  strokes: Stroke[],
+  annotations: TextAnnotation[]
+): string[] {
+  if (ids.length === 0) return ids;
+  const alive = new Set<string>();
+  for (const stroke of strokes) alive.add(stroke.id);
+  for (const annotation of annotations) alive.add(annotation.id);
+  return ids.filter(id => alive.has(id));
 }
 
 /** True when any point of the path lands inside the box (plus threshold). */

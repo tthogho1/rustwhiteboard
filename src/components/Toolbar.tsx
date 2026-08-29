@@ -467,6 +467,10 @@ export function Toolbar({ onTogglePreview }: ToolbarProps) {
               </table>
               <div className="shortcut-help-note">
                 Select tool: drag to rubber-band, Shift+click to add, drag the box to move.
+                Strokes and text select together.
+                <br />
+                With the detection overlay on (O), click a box&rsquo;s outline to fix its type
+                or drop it.
               </div>
             </div>
           </>

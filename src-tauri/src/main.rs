@@ -342,6 +342,30 @@ async fn update_shape_type(
     Ok(detected.clone())
 }
 
+/// Drop a spurious detection.
+///
+/// Detection over-reports on freehand input — a stray mark becomes a
+/// `freeform` shape and lands in the export. Removing it here keeps it out of
+/// the generated XML without touching the strokes it came from. Like the other
+/// corrections it lasts only until the analysis is re-run.
+#[tauri::command]
+async fn delete_shape(
+    state: State<'_, AppState>,
+    shape_id: String,
+) -> Result<Vec<shapes::DetectedShape>, String> {
+    let mut detected = state.detected_shapes.lock().map_err(|e| e.to_string())?;
+
+    let before = detected.len();
+    detected.retain(|s| s.id != shape_id);
+
+    if detected.len() == before {
+        return Err(format!("No detected shape with id {}", shape_id));
+    }
+    println!("[PROCESS] delete_shape: {} ({} -> {})", shape_id, before, detected.len());
+
+    Ok(detected.clone())
+}
+
 /// Generate draw.io XML from the processed diagram
 #[tauri::command]
 async fn generate_drawio(
@@ -522,6 +546,7 @@ fn main() {
             update_text_labels,
             sync_text_annotations,
             update_shape_type,
+            delete_shape,
             generate_drawio,
             export_drawio_file,
             configure_llm,

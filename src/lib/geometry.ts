@@ -1,4 +1,4 @@
-import type { Point, Stroke, TextAnnotation } from '../store';
+import type { DetectedShape, Point, Stroke, TextAnnotation } from '../store';
 
 export interface Rect {
   x: number;
@@ -33,26 +33,45 @@ export function strokeBounds(stroke: Stroke): Rect {
   };
 }
 
-/** Union of several strokes' bounds, or null when the list is empty. */
-export function unionBounds(strokes: Stroke[]): Rect | null {
-  if (strokes.length === 0) return null;
-
+/** Smallest rect containing all of them, or null when there are none. */
+export function unionRects(rects: Rect[]): Rect | null {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
 
-  for (const stroke of strokes) {
-    const b = strokeBounds(stroke);
-    if (b.width === 0 && b.height === 0 && stroke.points.length === 0) continue;
-    minX = Math.min(minX, b.x);
-    minY = Math.min(minY, b.y);
-    maxX = Math.max(maxX, b.x + b.width);
-    maxY = Math.max(maxY, b.y + b.height);
+  for (const r of rects) {
+    minX = Math.min(minX, r.x);
+    minY = Math.min(minY, r.y);
+    maxX = Math.max(maxX, r.x + r.width);
+    maxY = Math.max(maxY, r.y + r.height);
   }
 
   if (minX === Infinity) return null;
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+/**
+ * Bounding box of the current selection. The selection spans both strokes and
+ * text annotations, so both have to be measured to draw one box around it.
+ */
+export function selectionBounds(
+  strokes: Stroke[],
+  annotations: TextAnnotation[],
+  selectedIds: string[]
+): Rect | null {
+  if (selectedIds.length === 0) return null;
+  const selected = new Set(selectedIds);
+
+  const rects: Rect[] = [];
+  for (const stroke of strokes) {
+    if (selected.has(stroke.id) && stroke.points.length > 0) rects.push(strokeBounds(stroke));
+  }
+  for (const annotation of annotations) {
+    if (selected.has(annotation.id)) rects.push(annotationBounds(annotation));
+  }
+
+  return unionRects(rects);
 }
 
 export function rectContains(rect: Rect, x: number, y: number, pad = 0): boolean {
@@ -148,4 +167,68 @@ export function hitTestAnnotation(
     if (rectContains(annotationBounds(annotations[i]), x, y, pad)) return annotations[i];
   }
   return null;
+}
+
+/** Shortest distance from a point to the rectangle's outline (inside or out). */
+export function distanceToRectBorder(rect: Rect, x: number, y: number): number {
+  const { x: rx, y: ry, width, height } = rect;
+  const corners: Point[] = [
+    { x: rx, y: ry, timestamp: 0 },
+    { x: rx + width, y: ry, timestamp: 0 },
+    { x: rx + width, y: ry + height, timestamp: 0 },
+    { x: rx, y: ry + height, timestamp: 0 },
+  ];
+
+  let min = Infinity;
+  for (let i = 0; i < corners.length; i++) {
+    const d = distanceToSegment(x, y, corners[i], corners[(i + 1) % corners.length]);
+    if (d < min) min = d;
+  }
+  return min;
+}
+
+/**
+ * Detected shape whose overlay box the point is on, or null.
+ *
+ * Deliberately keyed on the *border* rather than the whole box: the overlay
+ * covers the drawing, and a shape's interior has to stay clickable for
+ * selecting the strokes underneath it. Smaller boxes win, so a shape nested
+ * inside another is still reachable.
+ */
+export function hitTestDetection(
+  shapes: DetectedShape[],
+  x: number,
+  y: number,
+  threshold: number
+): DetectedShape | null {
+  let best: DetectedShape | null = null;
+  let bestArea = Infinity;
+
+  for (const shape of shapes) {
+    const rect: Rect = {
+      x: shape.bounds.x,
+      y: shape.bounds.y,
+      width: shape.bounds.width,
+      height: shape.bounds.height,
+    };
+    if (distanceToRectBorder(rect, x, y) > threshold) continue;
+
+    const area = rect.width * rect.height;
+    if (area < bestArea) {
+      best = shape;
+      bestArea = area;
+    }
+  }
+
+  return best;
+}
+
+/** True when two rects share any area (marquee test for boxed items). */
+export function rectsOverlap(a: Rect, b: Rect): boolean {
+  return (
+    a.x < b.x + b.width &&
+    a.x + a.width > b.x &&
+    a.y < b.y + b.height &&
+    a.y + a.height > b.y
+  );
 }
